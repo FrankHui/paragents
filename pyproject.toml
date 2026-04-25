@@ -1,0 +1,17 @@
+[project]
+name = "paragents"
+version = "0.1.0"
+description = "Concurrent isolated agent runtime system"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "httpx>=0.27.0",
+]
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
