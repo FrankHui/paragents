@@ -35,6 +35,7 @@ def test_render_progress_blocks_for_multiple_active_tasks() -> None:
             retries=0,
             updated_at=3,
             latest_log="step=1",
+            key_logs=["step=1"],
             pending_approval_request_id="",
         ),
         TaskView(
@@ -44,6 +45,7 @@ def test_render_progress_blocks_for_multiple_active_tasks() -> None:
             retries=1,
             updated_at=2,
             latest_log="waiting",
+            key_logs=["waiting"],
             pending_approval_request_id="req-1",
         ),
         TaskView(
@@ -53,6 +55,7 @@ def test_render_progress_blocks_for_multiple_active_tasks() -> None:
             retries=0,
             updated_at=1,
             latest_log="queued",
+            key_logs=["queued"],
             pending_approval_request_id="",
         ),
     ]
@@ -64,10 +67,10 @@ def test_render_progress_blocks_for_multiple_active_tasks() -> None:
 
 
 def test_classify_task_highlight_variants() -> None:
-    approval_paused = TaskView("t1", "t1", "paused", 0, 1, "", "req-1")
-    normal_paused = TaskView("t2", "t2", "paused", 0, 1, "", "")
-    failed = TaskView("t3", "t3", "failed", 0, 1, "", "")
-    running = TaskView("t4", "t4", "running", 0, 1, "", "")
+    approval_paused = TaskView("t1", "t1", "paused", 0, 1, "", [""], "req-1")
+    normal_paused = TaskView("t2", "t2", "paused", 0, 1, "", [""], "")
+    failed = TaskView("t3", "t3", "failed", 0, 1, "", [""], "")
+    running = TaskView("t4", "t4", "running", 0, 1, "", [""], "")
     assert classify_task_highlight(approval_paused) == "approval_pause"
     assert classify_task_highlight(normal_paused) == "paused"
     assert classify_task_highlight(failed) == "failed"

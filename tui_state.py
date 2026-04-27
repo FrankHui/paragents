@@ -14,6 +14,7 @@ class TaskView:
     retries: int
     updated_at: float
     latest_log: str
+    key_logs: list[str]
     pending_approval_request_id: str
 
 
@@ -40,11 +41,35 @@ def build_task_views(tasks: dict[str, Task], logs_by_task: dict[str, list[str]])
                 retries=task.retries,
                 updated_at=task.updated_at,
                 latest_log=latest,
+                key_logs=_extract_key_logs(logs),
                 pending_approval_request_id=str(task.local_state.get("pending_approval_request_id", "")),
             )
         )
     views.sort(key=lambda v: v.updated_at, reverse=True)
     return views
+
+
+def _extract_key_logs(logs: list[str]) -> list[str]:
+    if not logs:
+        return []
+    keywords = (
+        "submitted",
+        "started",
+        "agent started",
+        "llm infer",
+        "tool call",
+        "tool observation received",
+        "waiting for approval",
+        "approval",
+        "resumed",
+        "failed",
+        "completed",
+        "finished successfully",
+        "task completed",
+        "cancelled",
+    )
+    key_logs = [line for line in logs if any(key in line.lower() for key in keywords)]
+    return key_logs if key_logs else logs
 
 
 def summarize_runtime(tasks: dict[str, Task], pending_approvals: int) -> RuntimeSummary:

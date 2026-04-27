@@ -437,7 +437,7 @@ def _parse_ack_indices(raw: str) -> list[int]:
 def _resolve_request_id_from_approve_cmd(
     cmd: str, pending_requests: list[tuple[str, str]] | list[str]
 ) -> str | None:
-    if not cmd.startswith("approve "):
+    if not (cmd.startswith("approve ") or cmd.startswith("deny ")):
         return None
     rest = cmd.split(" ", 1)[1].strip()
     parts = rest.split()
@@ -505,12 +505,14 @@ def _get_active_approval_request_id(
     run_task_id: str | None,
     watching_task_id: str | None,
 ) -> str | None:
-    if run_task_id is not None:
-        pending = _get_task_pending_approval_request_id(scheduler.tasks.get(run_task_id))
-        if pending:
-            return pending
+    # Foreground task should always win input focus.
+    # If user /show-ed a task that is waiting for approval, y/n should target it first.
     if watching_task_id is not None:
         pending = _get_task_pending_approval_request_id(scheduler.tasks.get(watching_task_id))
+        if pending:
+            return pending
+    if run_task_id is not None:
+        pending = _get_task_pending_approval_request_id(scheduler.tasks.get(run_task_id))
         if pending:
             return pending
     return None
@@ -547,6 +549,10 @@ async def _handle_run_approval_answer(
         ok = permission_manager.deny(request_id)
         if not ok:
             return ["approval request not found"]
+        failed = _fail_tasks_waiting_for_approval(scheduler, request_id, reason=f"approval denied ({short_id})")
+        if failed:
+            failed_short = ", ".join(_task_ref(scheduler.tasks, t) for t in failed)
+            return [f"denied {short_id}", f"failed tasks: {failed_short}"]
         return [f"denied {short_id}"]
     return ["请输入 y 或 n"]
 
@@ -569,9 +575,29 @@ async def _resume_tasks_waiting_for_approval(scheduler: Scheduler, request_id: s
         pending_id = str(task.local_state.get("pending_approval_request_id", ""))
         if pending_id != request_id:
             continue
+        task.local_state.pop("pending_approval_request_id", None)
+        task.local_state.pop("pending_approval_tool_name", None)
         await scheduler.resume(task_id)
         resumed.append(task_id)
     return resumed
+
+
+def _fail_tasks_waiting_for_approval(scheduler: Scheduler, request_id: str, reason: str) -> list[str]:
+    failed: list[str] = []
+    for task_id, task in scheduler.tasks.items():
+        if task.status != "paused":
+            continue
+        pending_id = str(task.local_state.get("pending_approval_request_id", ""))
+        if pending_id != request_id:
+            continue
+        task.local_state.pop("pending_approval_request_id", None)
+        task.local_state.pop("pending_approval_tool_name", None)
+        task.status = "failed"
+        task.error = reason
+        task.touch()
+        scheduler._publish_log(task_id, f"task failed: {reason}")  # noqa: SLF001
+        failed.append(task_id)
+    return failed
 
 
 async def _run_tui_mode() -> None:
@@ -689,11 +715,20 @@ async def _run_tui_mode() -> None:
         handled, lines = handle_approval_command(cmd, permission_manager)
         if handled:
             out.extend(lines)
-            approved_id = _resolve_request_id_from_approve_cmd(cmd, pending_ids_before)
-            if approved_id:
-                resumed = await _resume_tasks_waiting_for_approval(scheduler, approved_id)
-                if resumed:
-                    out.append("resumed tasks: " + ", ".join(_task_ref(scheduler.tasks, task_id) for task_id in resumed))
+            decision_request_id = _resolve_request_id_from_approve_cmd(cmd, pending_ids_before)
+            if decision_request_id:
+                if cmd.startswith("approve "):
+                    resumed = await _resume_tasks_waiting_for_approval(scheduler, decision_request_id)
+                    if resumed:
+                        out.append("resumed tasks: " + ", ".join(_task_ref(scheduler.tasks, task_id) for task_id in resumed))
+                elif cmd.startswith("deny "):
+                    failed = _fail_tasks_waiting_for_approval(
+                        scheduler,
+                        decision_request_id,
+                        reason=f"approval denied ({_request_ref(permission_manager, decision_request_id)})",
+                    )
+                    if failed:
+                        out.append("failed tasks: " + ", ".join(_task_ref(scheduler.tasks, task_id) for task_id in failed))
             return out
         parsed = _parse_submit(cmd)
         if parsed is not None:
@@ -773,10 +808,37 @@ async def _run_tui_mode() -> None:
             return ["resumed"]
         return ["unknown command"]
 
+    def _ack_pending_task_ids_provider() -> list[str]:
+        _refresh_submit_task_state()
+        return list(ack_pending_submit_tasks)
+
+    def _show_candidate_task_ids_provider() -> list[str]:
+        _refresh_submit_task_state()
+        terminal_states = {"completed", "failed", "cancelled"}
+        candidates: list[str] = []
+        for task_id, task in scheduler.tasks.items():
+            status = str(getattr(task, "status", ""))
+            if status not in terminal_states:
+                candidates.append(task_id)
+        for task_id in ack_pending_submit_tasks:
+            if task_id not in candidates:
+                candidates.append(task_id)
+        return candidates
+
+    def _pending_approval_request_refs_provider() -> list[str]:
+        return [req.request_ref for req in permission_manager.list_pending()]
+
     await run_tui(
         scheduler=scheduler,
         pending_approvals_provider=lambda: len(permission_manager.list_pending()),
         command_handler=_handle_cmd,
+        watching_task_id_provider=lambda: watching_task_id,
+        submit_slot_ids_provider=lambda: list(submit_task_slots),
+        ack_pending_task_ids_provider=_ack_pending_task_ids_provider,
+        show_candidate_task_ids_provider=_show_candidate_task_ids_provider,
+        approve_candidate_request_refs_provider=_pending_approval_request_refs_provider,
+        deny_candidate_request_refs_provider=_pending_approval_request_refs_provider,
+        request_ref_provider=lambda request_id: _request_ref(permission_manager, request_id),
     )
 
 

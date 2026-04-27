@@ -21,6 +21,14 @@
   - 高密度输出大量日志（stdout + 可选 stderr），用于测试小面板日志翻页
   - 示例：`python mock_tasks/py_long_logs_for_paging.py --lines 180 --delay-ms 10 --stderr-every 9 --tail-sleep 2`
 
+- `prompt_keynode_refresh.txt`
+  - 关键节点日志压测模板（非 stdout 刷屏）
+  - 通过多轮只读工具调用，产生高密度 `tool call / observation / processing` 事件
+  - 适合测试 submit 小面板“打满后刷新机制”
+  - 示例（建议用 submit）：
+    - `/submit $(cat mock_tasks/prompt_keynode_refresh.txt)`
+    - 或 `submit $(cat mock_tasks/prompt_keynode_refresh.txt)`
+
 ## Shell 脚本
 
 - `sh_sleep_success.sh`

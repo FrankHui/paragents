@@ -113,6 +113,169 @@ def test_main_log_highlight_for_approval_and_failed() -> None:
     assert "[X FAILED]" in text
 
 
+def test_approval_detail_line_is_before_confirm_prompt() -> None:
+    async def _handler(_: str) -> list[str]:
+        return []
+
+    scheduler = _FakeScheduler()
+    scheduler.tasks = {"task-1": object()}
+    scheduler.logs_by_task["task-1"] = [
+        "[12:00:00] waiting for approval request_id=abcdef123456 detail=type=capability_enable payload={'capability': 'shell'}"
+    ]
+    tui = ParagentsTUI(
+        scheduler=scheduler,  # type: ignore[arg-type]
+        pending_approvals_provider=lambda: 1,
+        command_handler=_handler,
+    )
+    tui.show_welcome = False
+    tui.watching_task_id = "task-1"
+    tui.watch_source = "show"
+    _ = tui._log_panel_text()
+    detail_idx = next(i for i, line in enumerate(tui.logs) if "type=capability_enable" in line)
+    prompt_idx = next(i for i, line in enumerate(tui.logs) if "输入 y/n 确认" in line)
+    assert detail_idx < prompt_idx
+
+
+def test_ack_prefix_auto_popup_and_enter_fill_only() -> None:
+    async def _handler(_: str) -> list[str]:
+        return []
+
+    scheduler = _FakeScheduler()
+    task = Task(task_id="aaaaaa111111", input="x", status="completed", task_ref="aa11bb")
+    scheduler.tasks = {task.task_id: task}
+    scheduler.logs_by_task[task.task_id] = ["done"]
+    tui = ParagentsTUI(
+        scheduler=scheduler,  # type: ignore[arg-type]
+        pending_approvals_provider=lambda: 0,
+        command_handler=_handler,
+        ack_pending_task_ids_provider=lambda: [task.task_id],
+    )
+    tui.show_welcome = False
+    tui.input_buffer.text = "/ack"
+    tui._refresh_context_popup()
+    assert tui.context_popup_mode == "ack"
+    assert tui.context_candidates[0][0] == "aa11bb"
+
+    tui._apply_context_selection()
+    assert tui.input_buffer.text == "/ack aa11bb"
+    assert tui.context_popup_mode is None
+
+
+def test_show_prefix_popup_contains_running_and_unacked_completed() -> None:
+    async def _handler(_: str) -> list[str]:
+        return []
+
+    scheduler = _FakeScheduler()
+    running = Task(task_id="bbbbbb222222", input="x", status="running", task_ref="bb22cc")
+    unacked_done = Task(task_id="cccccc333333", input="x", status="completed", task_ref="cc33dd")
+    scheduler.tasks = {running.task_id: running, unacked_done.task_id: unacked_done}
+    scheduler.logs_by_task[running.task_id] = ["run"]
+    scheduler.logs_by_task[unacked_done.task_id] = ["done"]
+    tui = ParagentsTUI(
+        scheduler=scheduler,  # type: ignore[arg-type]
+        pending_approvals_provider=lambda: 0,
+        command_handler=_handler,
+        show_candidate_task_ids_provider=lambda: [running.task_id, unacked_done.task_id],
+    )
+    tui.show_welcome = False
+    tui.input_buffer.text = "/show"
+    tui._refresh_context_popup()
+    assert tui.context_popup_mode == "show"
+    assert {token for token, _ in tui.context_candidates} == {"bb22cc", "cc33dd"}
+
+
+def test_context_popup_height_matches_candidates() -> None:
+    async def _handler(_: str) -> list[str]:
+        return []
+
+    scheduler = _FakeScheduler()
+    t1 = Task(task_id="t11111111111", input="x", status="running", task_ref="t1a1a1")
+    t2 = Task(task_id="t22222222222", input="y", status="running", task_ref="t2b2b2")
+    scheduler.tasks = {t1.task_id: t1, t2.task_id: t2}
+    scheduler.logs_by_task[t1.task_id] = ["line"]
+    scheduler.logs_by_task[t2.task_id] = ["line"]
+    tui = ParagentsTUI(
+        scheduler=scheduler,  # type: ignore[arg-type]
+        pending_approvals_provider=lambda: 0,
+        command_handler=_handler,
+        show_candidate_task_ids_provider=lambda: [t1.task_id, t2.task_id],
+    )
+    tui.show_welcome = False
+    tui.input_buffer.text = "/show"
+    tui._refresh_context_popup()
+    _ = tui._popup_text()
+    assert tui.parts.popup_float.height == 6
+
+
+def test_approve_and_deny_prefix_popup_fill_request_ref() -> None:
+    async def _handler(_: str) -> list[str]:
+        return []
+
+    tui = ParagentsTUI(
+        scheduler=_FakeScheduler(),  # type: ignore[arg-type]
+        pending_approvals_provider=lambda: 1,
+        command_handler=_handler,
+        approve_candidate_request_refs_provider=lambda: ["a1b2c3"],
+        deny_candidate_request_refs_provider=lambda: ["d4e5f6"],
+    )
+    tui.show_welcome = False
+
+    tui.input_buffer.text = "/approve"
+    tui._refresh_context_popup()
+    assert tui.context_popup_mode == "approve"
+    assert tui.context_candidates == [("a1b2c3", "a1b2c3 [pending approval]")]
+    tui._apply_context_selection()
+    assert tui.input_buffer.text == "/approve a1b2c3"
+
+    tui.input_buffer.text = "/deny"
+    tui._refresh_context_popup()
+    assert tui.context_popup_mode == "deny"
+    assert tui.context_candidates == [("d4e5f6", "d4e5f6 [pending approval]")]
+    tui._apply_context_selection()
+    assert tui.input_buffer.text == "/deny d4e5f6"
+
+
+def test_submit_panel_shows_task_name_and_pending_request_id() -> None:
+    async def _handler(_: str) -> list[str]:
+        return []
+
+    scheduler = _FakeScheduler()
+    task = Task(task_id="24fefd401234", input="run long task name for panel", status="paused")
+    task.local_state["pending_approval_request_id"] = "24fefd40-54f7-43e0-b15a-303cfbe0c103"
+    scheduler.tasks = {task.task_id: task}
+    scheduler.logs_by_task[task.task_id] = ["waiting for approval request_id=24fefd40-54f7-43e0-b15a-303cfbe0c103"]
+    tui = ParagentsTUI(
+        scheduler=scheduler,  # type: ignore[arg-type]
+        pending_approvals_provider=lambda: 1,
+        command_handler=_handler,
+    )
+    tui._submit_slot_ids = [task.task_id]
+    text = tui._submit_panel_text(0)
+    assert "run long task name" in text
+    assert "request_id=24fefd" in text
+    assert text.count("request_id=") == 1
+
+
+def test_submit_panel_uses_request_ref_provider_for_pending_request_id() -> None:
+    async def _handler(_: str) -> list[str]:
+        return []
+
+    scheduler = _FakeScheduler()
+    task = Task(task_id="24fefd401234", input="x", status="paused")
+    task.local_state["pending_approval_request_id"] = "147716ab-54f7-43e0-b15a-303cfbe0c103"
+    scheduler.tasks = {task.task_id: task}
+    scheduler.logs_by_task[task.task_id] = ["waiting for approval request_id=147716ab-54f7-43e0-b15a-303cfbe0c103"]
+    tui = ParagentsTUI(
+        scheduler=scheduler,  # type: ignore[arg-type]
+        pending_approvals_provider=lambda: 1,
+        command_handler=_handler,
+        request_ref_provider=lambda req_id: "fb67aa" if req_id.startswith("147716ab") else req_id[:6],
+    )
+    tui._submit_slot_ids = [task.task_id]
+    text = tui._submit_panel_text(0)
+    assert "waiting for approval request_id=fb67aa" in text
+    assert text.count("request_id=") == 1
+
 def test_task_prefix_style_is_consistent_for_same_task() -> None:
     async def _handler(_: str) -> list[str]:
         return []
@@ -155,6 +318,61 @@ def test_attention_marker_for_paused_with_approval() -> None:
     marker, style = tui._attention_marker("paused", "waiting for approval request_id=req-1")
     assert marker == "[! APPROVAL]"
     assert "status.approval" in style or style == ""
+
+
+def test_attention_marker_failed_has_priority_over_approval_log() -> None:
+    async def _handler(_: str) -> list[str]:
+        return []
+
+    tui = ParagentsTUI(
+        scheduler=_FakeScheduler(),  # type: ignore[arg-type]
+        pending_approvals_provider=lambda: 1,
+        command_handler=_handler,
+    )
+    marker, style = tui._attention_marker("failed", "waiting for approval request_id=req-1")
+    assert marker == "[X FAILED]"
+    assert "status.failed" in style or style == ""
+
+
+def test_attention_marker_pending_does_not_blink_as_approval() -> None:
+    async def _handler(_: str) -> list[str]:
+        return []
+
+    tui = ParagentsTUI(
+        scheduler=_FakeScheduler(),  # type: ignore[arg-type]
+        pending_approvals_provider=lambda: 0,
+        command_handler=_handler,
+    )
+    marker, style = tui._attention_marker("pending", "waiting for approval request_id=req-1")
+    assert marker == "[PENDING]"
+    assert style == ""
+
+
+def test_submit_request_line_blinks_only_when_paused_and_pending_request() -> None:
+    async def _handler(_: str) -> list[str]:
+        return []
+
+    scheduler = _FakeScheduler()
+    task = Task(task_id="24fefd401234", input="x", status="paused")
+    task.local_state["pending_approval_request_id"] = "24fefd40-54f7-43e0-b15a-303cfbe0c103"
+    scheduler.tasks = {task.task_id: task}
+    scheduler.logs_by_task[task.task_id] = [
+        "[02:06:54] waiting for approval request_id=24fefd40-54f7-43e0-b15a-303cfbe0c103 detail=type=capability_enable"
+    ]
+    tui = ParagentsTUI(
+        scheduler=scheduler,  # type: ignore[arg-type]
+        pending_approvals_provider=lambda: 1,
+        command_handler=_handler,
+    )
+    tui._submit_slot_ids = [task.task_id]
+    tui._blink_on = True
+    frags = tui._submit_panel_formatted(0)
+    assert any(style == "class:status.approval" and "request_id=" in text for style, text in frags)
+
+    task.status = "pending"
+    task.local_state["pending_approval_request_id"] = ""
+    frags_after = tui._submit_panel_formatted(0)
+    assert not any(style == "class:status.approval" and "request_id=" in text for style, text in frags_after)
 
 
 def test_welcome_text_mentions_4_plus_1_and_foreground_background() -> None:
@@ -247,6 +465,32 @@ def test_submit_panel_compact_request_id_and_clip_long_line() -> None:
     assert "..." in text
 
 
+def test_submit_panel_prints_multiple_key_logs_line_by_line() -> None:
+    async def _handler(_: str) -> list[str]:
+        return []
+
+    scheduler = _FakeScheduler()
+    task = Task(task_id="aa11bb22cc33", input="x", status="running")
+    scheduler.tasks = {task.task_id: task}
+    scheduler.logs_by_task[task.task_id] = [
+        "[02:06:51] step=1: llm infer",
+        "[02:06:52] step=1: tool call -> read_file",
+        "[02:06:53] step=1: tool observation received",
+        "[02:06:54] step=2: llm infer",
+    ]
+    tui = ParagentsTUI(
+        scheduler=scheduler,  # type: ignore[arg-type]
+        pending_approvals_provider=lambda: 0,
+        command_handler=_handler,
+    )
+    tui._submit_slot_ids = [task.task_id]
+    text = tui._submit_panel_text(0)
+    assert "step=1: llm infer" in text
+    assert "step=1: tool call -> read_file" in text
+    assert "step=1: tool observation received" in text
+    assert "step=2: llm infer" in text
+
+
 def test_digit_key_inserts_digit_when_options_hidden() -> None:
     async def _handler(_: str) -> list[str]:
         return []
@@ -298,3 +542,85 @@ def test_run_command_always_appends_output_lines() -> None:
     tui.show_welcome = False
     asyncio.run(tui._run_command("run hello"))
     assert any("submitted:" in line for line in tui.logs)
+
+
+def test_log_panel_uses_dynamic_line_limit_instead_of_fixed_30() -> None:
+    async def _handler(_: str) -> list[str]:
+        return []
+
+    tui = ParagentsTUI(
+        scheduler=_FakeScheduler(),  # type: ignore[arg-type]
+        pending_approvals_provider=lambda: 0,
+        command_handler=_handler,
+    )
+    tui.show_welcome = False
+    tui.logs = [f"line-{idx}" for idx in range(40)]
+    text = tui._log_panel_text()
+    assert "line-0" not in text
+    assert "line-39" in text
+    assert "line-10" in text
+
+
+def test_provider_driven_state_keeps_task_only_in_foreground_panel() -> None:
+    async def _handler(_: str) -> list[str]:
+        return []
+
+    scheduler = _FakeScheduler()
+    watch_task = Task(task_id="faceaa111111", input="x", status="running")
+    submit_task = Task(task_id="beefbb222222", input="y", status="running")
+    scheduler.tasks = {watch_task.task_id: watch_task, submit_task.task_id: submit_task}
+    scheduler.logs_by_task[watch_task.task_id] = ["watch log"]
+    scheduler.logs_by_task[submit_task.task_id] = ["submit log"]
+    ui_state = {
+        "watching_task_id": watch_task.task_id,
+        "submit_slot_ids": [watch_task.task_id, submit_task.task_id],
+    }
+    tui = ParagentsTUI(
+        scheduler=scheduler,  # type: ignore[arg-type]
+        pending_approvals_provider=lambda: 0,
+        command_handler=_handler,
+        watching_task_id_provider=lambda: ui_state["watching_task_id"],
+        submit_slot_ids_provider=lambda: list(ui_state["submit_slot_ids"]),
+    )
+    tui.show_welcome = False
+
+    submit_views = tui._submit_task_views()
+    assert all(v.task_id != watch_task.task_id for v in submit_views)
+    assert any(v.task_id == submit_task.task_id for v in submit_views)
+
+
+def test_provider_driven_show_hide_roundtrip_updates_submit_panels() -> None:
+    async def _handler(_: str) -> list[str]:
+        return []
+
+    scheduler = _FakeScheduler()
+    task_a = Task(task_id="aaa111111111", input="x", status="running")
+    task_b = Task(task_id="bbb222222222", input="y", status="running")
+    scheduler.tasks = {task_a.task_id: task_a, task_b.task_id: task_b}
+    scheduler.logs_by_task[task_a.task_id] = ["line a"]
+    scheduler.logs_by_task[task_b.task_id] = ["line b"]
+    ui_state = {
+        "watching_task_id": None,
+        "submit_slot_ids": [task_a.task_id, task_b.task_id],
+    }
+    tui = ParagentsTUI(
+        scheduler=scheduler,  # type: ignore[arg-type]
+        pending_approvals_provider=lambda: 0,
+        command_handler=_handler,
+        watching_task_id_provider=lambda: ui_state["watching_task_id"],
+        submit_slot_ids_provider=lambda: list(ui_state["submit_slot_ids"]),
+    )
+    tui.show_welcome = False
+
+    before = [v.task_id for v in tui._submit_task_views()]
+    assert set(before) == {task_a.task_id, task_b.task_id}
+
+    ui_state["watching_task_id"] = task_a.task_id
+    ui_state["submit_slot_ids"] = [task_b.task_id]
+    during = [v.task_id for v in tui._submit_task_views()]
+    assert during == [task_b.task_id]
+
+    ui_state["watching_task_id"] = None
+    ui_state["submit_slot_ids"] = [task_a.task_id, task_b.task_id]
+    after = [v.task_id for v in tui._submit_task_views()]
+    assert set(after) == {task_a.task_id, task_b.task_id}

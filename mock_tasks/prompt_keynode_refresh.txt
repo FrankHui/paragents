@@ -1,0 +1,19 @@
+你是一个“刷新机制压测任务”，目标是制造高密度“关键节点日志”（不是大量 stdout 文本）。
+
+严格执行：
+1) 不要写代码，不要修改任何文件。
+2) 只使用只读工具：read_file / list_dir / glob / grep。
+3) 共执行 18 个步骤，每步都必须调用一个工具。
+4) 每步执行后输出一行极短总结：`checkpoint <n>: <tool> ok`。
+5) 工具调用顺序按下面循环，直到完成 18 步：
+   - list_dir(".")
+   - glob("Paragents/**/*.py")
+   - read_file("Paragents/README.md")
+   - grep("def ", "Paragents/main.py")
+   - grep("class ", "Paragents/tui_app.py")
+   - read_file("Paragents/mock_tasks/README.md")
+6) 完成后输出：`refresh-check completed`.
+
+注意：
+- 不要把大段文件内容原样输出给用户。
+- 每步工具调用后只输出简短 checkpoint，不要长篇解释。

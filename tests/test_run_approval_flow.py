@@ -59,6 +59,7 @@ def test_handle_run_approval_answer_approve_resumes(tmp_path) -> None:
     lines = asyncio.run(_handle_run_approval_answer("y", request_id, manager, scheduler))
     assert any("approved" in line for line in lines)
     assert task.status == "pending"
+    assert task.local_state.get("pending_approval_request_id", "") == ""
 
 
 def test_handle_run_approval_answer_deny(tmp_path) -> None:
@@ -67,8 +68,29 @@ def test_handle_run_approval_answer_deny(tmp_path) -> None:
     pending_req = manager.list_pending()[0]
     request_id = pending_req.request_id
     scheduler = Scheduler(llm_client=None)
+    task = Task(task_id="task-deny-base", input="x", status="paused")
+    task.local_state["pending_approval_request_id"] = request_id
+    scheduler.tasks[task.task_id] = task
     lines = asyncio.run(_handle_run_approval_answer("n", request_id, manager, scheduler))
-    assert lines == [f"denied {pending_req.request_ref}"]
+    assert any(line.startswith(f"denied {pending_req.request_ref}") for line in lines)
+    assert any("failed tasks:" in line for line in lines)
+    assert task.status == "failed"
+
+
+def test_handle_run_approval_answer_deny_fails_waiting_task(tmp_path) -> None:
+    manager = _build_manager(tmp_path)
+    manager.check_shell_command("python -V")
+    pending_req = manager.list_pending()[0]
+    request_id = pending_req.request_id
+    scheduler = Scheduler(llm_client=None)
+    task = Task(task_id="task-deny-1", input="x", status="paused")
+    task.local_state["pending_approval_request_id"] = request_id
+    scheduler.tasks[task.task_id] = task
+
+    lines = asyncio.run(_handle_run_approval_answer("n", request_id, manager, scheduler))
+    assert any(line.startswith("denied ") for line in lines)
+    assert any("failed tasks:" in line for line in lines)
+    assert task.status == "failed"
 
 
 def test_resolve_request_id_from_approve_cmd_supports_short_prefix() -> None:
@@ -96,7 +118,7 @@ def test_watch_slot_blocking_only_for_active_status() -> None:
     assert _is_watch_slot_blocking(scheduler, None) is False
 
 
-def test_get_active_approval_request_id_prefers_run_then_watch() -> None:
+def test_get_active_approval_request_id_prefers_foreground_watch() -> None:
     scheduler = Scheduler(llm_client=None)
     run_task = Task(task_id="run-1", input="x", status="paused")
     run_task.local_state["pending_approval_request_id"] = "req-run"
@@ -105,6 +127,6 @@ def test_get_active_approval_request_id_prefers_run_then_watch() -> None:
     scheduler.tasks[run_task.task_id] = run_task
     scheduler.tasks[watch_task.task_id] = watch_task
 
-    assert _get_active_approval_request_id(scheduler, run_task.task_id, watch_task.task_id) == "req-run"
+    assert _get_active_approval_request_id(scheduler, run_task.task_id, watch_task.task_id) == "req-watch"
     assert _get_active_approval_request_id(scheduler, None, watch_task.task_id) == "req-watch"
     assert _get_active_approval_request_id(scheduler, None, None) is None
