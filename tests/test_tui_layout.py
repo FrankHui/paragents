@@ -38,6 +38,21 @@ def test_options_overlay_does_not_replace_log_panel_text() -> None:
     assert tui._log_panel_text() == "hello"
 
 
+def test_scroll_hint_text_is_non_empty() -> None:
+    async def _handler(_: str) -> list[str]:
+        return []
+
+    tui = ParagentsTUI(
+        scheduler=_FakeScheduler(),  # type: ignore[arg-type]
+        pending_approvals_provider=lambda: 0,
+        command_handler=_handler,
+    )
+    hint = tui._scroll_hint_text()
+    assert "Log Scroll:" in hint
+    assert "PageDown" in hint or "Fn+" in hint
+    assert "Ctrl+K/Ctrl+J" in hint
+
+
 def test_watch_logs_are_appended_into_unified_stream() -> None:
     async def _handler(_: str) -> list[str]:
         return []
@@ -559,6 +574,50 @@ def test_log_panel_uses_dynamic_line_limit_instead_of_fixed_30() -> None:
     assert "line-0" not in text
     assert "line-39" in text
     assert "line-10" in text
+
+
+def test_main_panel_slice_respects_back_offset_window() -> None:
+    async def _handler(_: str) -> list[str]:
+        return []
+
+    tui = ParagentsTUI(
+        scheduler=_FakeScheduler(),  # type: ignore[arg-type]
+        pending_approvals_provider=lambda: 0,
+        command_handler=_handler,
+    )
+    tui.show_welcome = False
+    tui.logs = [f"line-{idx}" for idx in range(100)]
+    tui._side_log_back_offset = 20
+    tui._log_line_limit = lambda: 10  # type: ignore[method-assign]
+
+    text = tui._log_panel_text()
+    assert "line-70" in text
+    assert "line-79" in text
+    assert "line-80" not in text
+    assert "line-99" not in text
+
+
+def test_main_panel_review_mode_does_not_jump_to_latest_on_new_logs() -> None:
+    async def _handler(_: str) -> list[str]:
+        return []
+
+    tui = ParagentsTUI(
+        scheduler=_FakeScheduler(),  # type: ignore[arg-type]
+        pending_approvals_provider=lambda: 0,
+        command_handler=_handler,
+    )
+    tui.show_welcome = False
+    tui.logs = [f"line-{idx}" for idx in range(100)]
+    tui._side_log_back_offset = 20
+    tui._log_line_limit = lambda: 10  # type: ignore[method-assign]
+
+    _ = tui._log_panel_text()
+    tui.logs.extend(["line-100", "line-101"])
+    text = tui._log_panel_text()
+
+    assert tui._side_log_back_offset == 20
+    assert "line-101" not in text
+    assert "line-99" not in text
 
 
 def test_provider_driven_state_keeps_task_only_in_foreground_panel() -> None:

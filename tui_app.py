@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import platform
 import re
 from typing import Any, Awaitable, Callable
 
@@ -32,6 +33,7 @@ class TUILayoutParts:
     submit_panel_4: Window
     command_prefix: Window
     command_bar: Window
+    scroll_hint: Window
     options_popup: Window
     popup_float: Float
 
@@ -58,10 +60,22 @@ def build_tui_layout(
         FormattedTextControl("You: "),
         width=5,
         dont_extend_width=True,
-        height=1,
+        height=Dimension(min=1, max=4),
         style="class:panel.command",
     )
-    command_bar = Window(FormattedTextControl("command_bar"), height=1, style="class:panel.command")
+    command_bar = Window(
+        FormattedTextControl("command_bar"),
+        wrap_lines=True,
+        height=Dimension(min=1, max=4),
+        style="class:panel.command",
+    )
+    scroll_hint = Window(
+        FormattedTextControl("scroll_hint"),
+        width=Dimension(weight=2, min=30),
+        height=1,
+        dont_extend_height=True,
+        style="class:hint.scroll",
+    )
 
     submit_single = ConditionalContainer(
         content=submit_panel_1,
@@ -102,8 +116,17 @@ def build_tui_layout(
         width=Dimension(weight=3, min=52),
     )
     main_area = VSplit([log_panel, Window(width=1, char="│", style="class:separator"), right_col])
+    hint_row = VSplit([scroll_hint])
     cmd_row = VSplit([command_prefix, command_bar])
-    base_root = HSplit([main_area, Window(height=1, char="─", style="class:separator"), cmd_row], style="class:root")
+    base_root = HSplit(
+        [
+            main_area,
+            Window(height=1, char="─", style="class:separator"),
+            hint_row,
+            cmd_row,
+        ],
+        style="class:root",
+    )
     options_popup = Window(FormattedTextControl("options_popup"), wrap_lines=False, style="class:panel.popup")
     popup_float = Float(
         content=ConditionalContainer(content=options_popup, filter=show_options_filter),
@@ -126,6 +149,7 @@ def build_tui_layout(
         submit_panel_4=submit_panel_4,
         command_prefix=command_prefix,
         command_bar=command_bar,
+        scroll_hint=scroll_hint,
         options_popup=options_popup,
         popup_float=popup_float,
     )
@@ -177,6 +201,7 @@ class ParagentsTUI:
         self.input_buffer = Buffer(
             history=self.command_history,
             completer=self.command_completer,
+            multiline=True,
             complete_while_typing=False,
             on_text_changed=self._on_input_changed,
         )
@@ -271,6 +296,7 @@ class ParagentsTUI:
                 "panel.command": "bg:#070b16 #dbe4ff",
                 "panel.popup": "bg:#1a1436 #f5ddff",
                 "separator": "bg:#0b1020 #3b82f6",
+                "hint.scroll": "bg:#08121f #67e8f9 bold",
                 "status.approval": "fg:#fbbf24 bold",
                 "status.paused": "fg:#f59e0b",
                 "status.failed": "fg:#ef4444 bold",
@@ -286,7 +312,14 @@ class ParagentsTUI:
         self.parts.submit_panel_4.content = FormattedTextControl(lambda: self._submit_panel_formatted(3))
         self.parts.command_bar.content = BufferControl(buffer=self.input_buffer, focusable=True)
         self.parts.command_prefix.content = FormattedTextControl("You: ")
+        self.parts.scroll_hint.content = FormattedTextControl(self._scroll_hint_text)
         self.parts.options_popup.content = FormattedTextControl(self._popup_text)
+
+    def _scroll_hint_text(self) -> str:
+        system = platform.system().lower()
+        if system == "darwin":
+            return " Log Scroll: Fn+↑/Fn+↓ | line: Ctrl+K/Ctrl+J "
+        return " Log Scroll: PageUp/PageDown | line: Ctrl+K/Ctrl+J "
 
     def _on_input_changed(self, _buffer: Buffer) -> None:
         if self.show_options:
@@ -432,13 +465,9 @@ class ParagentsTUI:
         # Reserve rows for command bar/separators/spinner headroom.
         return max(30, rows - 4)
 
-    def _log_panel_text(self) -> str:
-        self._refresh_external_state()
-        self._blink_on = not self._blink_on
-        if self.show_welcome:
-            return self._welcome_text()
+    def _main_panel_lines(self) -> list[str]:
         self._append_watch_logs()
-        lines = self.logs[-self._log_line_limit() :]
+        lines = list(self.logs)
         if self.watch_source is not None and self.watching_task_id and self.watching_task_id in self.scheduler.tasks:
             task = self.scheduler.tasks[self.watching_task_id]
             task_status = getattr(task, "status", "")
@@ -447,7 +476,42 @@ class ParagentsTUI:
                 phase = self._watch_phase_by_task.get(self.watching_task_id, "thinking...")
                 task_ref = self._task_ref(self.watching_task_id)
                 lines.append(f"{self._spinner_frames[self._spinner_idx]} assistant({task_ref}): {phase}")
-        return "\n".join(lines)
+        return lines
+
+    def _slice_main_panel_lines(self, lines: list[str]) -> list[str]:
+        line_limit = self._log_line_limit()
+        if not lines:
+            return []
+        if len(lines) <= line_limit:
+            return lines
+        max_back = max(0, len(lines) - line_limit)
+        self._side_log_back_offset = max(0, min(self._side_log_back_offset, max_back))
+        end = len(lines) - self._side_log_back_offset
+        start = max(0, end - line_limit)
+        return lines[start:end]
+
+    def _scroll_main_logs(self, delta_lines: int) -> None:
+        all_lines = self._main_panel_lines()
+        if not all_lines:
+            return
+        line_limit = self._log_line_limit()
+        max_back = max(0, len(all_lines) - line_limit)
+        self._side_log_back_offset = max(0, min(max_back, self._side_log_back_offset + delta_lines))
+
+    def _history_up(self) -> None:
+        self.input_buffer.history_backward(count=1)
+        self.input_buffer.cursor_position = len(self.input_buffer.text)
+
+    def _history_down(self) -> None:
+        self.input_buffer.history_forward(count=1)
+        self.input_buffer.cursor_position = len(self.input_buffer.text)
+
+    def _log_panel_text(self) -> str:
+        self._refresh_external_state()
+        self._blink_on = not self._blink_on
+        if self.show_welcome:
+            return self._welcome_text()
+        return "\n".join(self._slice_main_panel_lines(self._main_panel_lines()))
 
     def _log_panel_formatted(self) -> list[tuple[str, str]]:
         text = self._log_panel_text()
@@ -740,7 +804,7 @@ class ParagentsTUI:
                 self.context_selected = (self.context_selected - 1) % len(self.context_candidates)
                 return
             if event.app.layout.has_focus(self.parts.command_bar):
-                self.input_buffer.auto_up()
+                self._history_up()
                 return
 
         @kb.add("down")
@@ -752,29 +816,24 @@ class ParagentsTUI:
                 self.context_selected = (self.context_selected + 1) % len(self.context_candidates)
                 return
             if event.app.layout.has_focus(self.parts.command_bar):
-                self.input_buffer.auto_down()
+                self._history_down()
                 return
 
         @kb.add("pageup")
         def _page_up(event) -> None:  # noqa: ANN001, ARG001
-            active_task_id = self.watching_task_id
-            if not active_task_id:
-                return
-            total = len(self.scheduler.get_task_logs(active_task_id, limit=5000))
-            if total <= 0:
-                return
-            page_size = max(5, self._side_log_page_size)
-            max_back_offset = max(0, total - page_size)
-            self._side_log_back_offset = min(max_back_offset, self._side_log_back_offset + page_size)
-            self._side_log_task_id = active_task_id
+            self._scroll_main_logs(max(5, self._side_log_page_size))
 
         @kb.add("pagedown")
         def _page_down(event) -> None:  # noqa: ANN001, ARG001
-            active_task_id = self.watching_task_id
-            if not active_task_id:
-                return
-            self._side_log_back_offset = max(0, self._side_log_back_offset - max(5, self._side_log_page_size))
-            self._side_log_task_id = active_task_id
+            self._scroll_main_logs(-max(5, self._side_log_page_size))
+
+        @kb.add("c-k")
+        def _line_up(event) -> None:  # noqa: ANN001, ARG001
+            self._scroll_main_logs(1)
+
+        @kb.add("c-j")
+        def _line_down(event) -> None:  # noqa: ANN001, ARG001
+            self._scroll_main_logs(-1)
 
         @kb.add("enter")
         def _enter(event) -> None:  # noqa: ANN001
