@@ -8,6 +8,9 @@ from main import (
     _handle_run_approval_answer,
     _is_watch_slot_blocking,
     _normalize_user_input,
+    _parse_new,
+    _parse_run,
+    _parse_submit,
     _parse_ack_indices,
     _resolve_request_id_from_approve_cmd,
 )
@@ -34,8 +37,15 @@ def _build_manager(tmp_path):
 def test_normalize_user_input_preserves_yn() -> None:
     assert _normalize_user_input("y") == "y"
     assert _normalize_user_input("n") == "n"
-    assert _normalize_user_input("hello") == "run hello"
+    assert _normalize_user_input("hello") == "hello"
     assert _normalize_user_input("/list") == "list"
+
+
+def test_parse_new_run_submit_commands() -> None:
+    assert _parse_new("new hello") == "hello"
+    assert _parse_run("run hello") == "hello"
+    assert _parse_submit("submit hello") == "hello"
+    assert _parse_new("run hello") is None
 
 
 def test_get_task_pending_approval_request_id() -> None:
@@ -130,3 +140,17 @@ def test_get_active_approval_request_id_prefers_foreground_watch() -> None:
     assert _get_active_approval_request_id(scheduler, run_task.task_id, watch_task.task_id) == "req-watch"
     assert _get_active_approval_request_id(scheduler, None, watch_task.task_id) == "req-watch"
     assert _get_active_approval_request_id(scheduler, None, None) is None
+
+
+def test_scheduler_continue_task_reuses_same_task_id() -> None:
+    scheduler = Scheduler(llm_client=None)
+    task = Task(task_id="keep-1", input="first", status="completed")
+    task.local_state["initial_input"] = "first"
+    scheduler.tasks[task.task_id] = task
+    scheduler._task_tools[task.task_id] = {}  # noqa: SLF001
+    ok = asyncio.run(scheduler.continue_task(task.task_id, "hello"))
+    assert ok is True
+    assert task.task_id == "keep-1"
+    assert task.input == "hello"
+    assert task.local_state["initial_input"] == "first"
+    assert task.status == "pending"

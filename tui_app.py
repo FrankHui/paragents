@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from dataclasses import dataclass
 import hashlib
 import platform
 import re
+import time
 from typing import Any, Awaitable, Callable
 
 from prompt_toolkit.application import Application
@@ -161,6 +164,9 @@ class ParagentsTUI:
         scheduler: Scheduler,
         pending_approvals_provider: Callable[[], int],
         command_handler: Callable[[str], Awaitable[list[str]]],
+        foreground_task_id_provider: Callable[[], str | None] | None = None,
+        task_slot_ids_provider: Callable[[], list[str]] | None = None,
+        finish_candidate_task_ids_provider: Callable[[], list[str]] | None = None,
         watching_task_id_provider: Callable[[], str | None] | None = None,
         submit_slot_ids_provider: Callable[[], list[str]] | None = None,
         ack_pending_task_ids_provider: Callable[[], list[str]] | None = None,
@@ -172,9 +178,9 @@ class ParagentsTUI:
         self.scheduler = scheduler
         self.pending_approvals_provider = pending_approvals_provider
         self.command_handler = command_handler
-        self.watching_task_id_provider = watching_task_id_provider
-        self.submit_slot_ids_provider = submit_slot_ids_provider
-        self.ack_pending_task_ids_provider = ack_pending_task_ids_provider
+        self.foreground_task_id_provider = foreground_task_id_provider or watching_task_id_provider
+        self.task_slot_ids_provider = task_slot_ids_provider or submit_slot_ids_provider
+        self.finish_candidate_task_ids_provider = finish_candidate_task_ids_provider or ack_pending_task_ids_provider
         self.show_candidate_task_ids_provider = show_candidate_task_ids_provider
         self.approve_candidate_request_refs_provider = approve_candidate_request_refs_provider
         self.deny_candidate_request_refs_provider = deny_candidate_request_refs_provider
@@ -182,10 +188,13 @@ class ParagentsTUI:
         self.command_history = InMemoryHistory()
         self.command_completer = WordCompleter(
             [
+                "/new",
                 "/run",
+                "/submit",
                 "/list",
                 "/show",
-                "/hide",
+                "/log",
+                "/finish",
                 "/approvals",
                 "/approve",
                 "/deny",
@@ -198,6 +207,23 @@ class ParagentsTUI:
             ignore_case=True,
             sentence=True,
         )
+        self._slash_commands: list[str] = [
+            "/new",
+            "/run",
+            "/submit",
+            "/list",
+            "/show",
+            "/log",
+            "/finish",
+            "/approvals",
+            "/approve",
+            "/deny",
+            "/pause",
+            "/resume",
+            "/cancel",
+            "/quit",
+            "/exit",
+        ]
         self.input_buffer = Buffer(
             history=self.command_history,
             completer=self.command_completer,
@@ -205,20 +231,23 @@ class ParagentsTUI:
             complete_while_typing=False,
             on_text_changed=self._on_input_changed,
         )
-        self.watching_task_id: str | None = None
-        self.watch_source: str | None = None  # run | show | None
+        self.foreground_task_id: str | None = None
+        self.log_view_task_id: str | None = None
+        self.watch_source: str | None = None
         self.selected_task_id: str | None = None
         self.show_welcome = True
         self.show_options = False
-        self.context_popup_mode: str | None = None  # ack | show | approve | deny | None
+        self.context_popup_mode: str | None = None  # slash | finish | show | approve | deny | None
         self.context_candidates: list[tuple[str, str]] = []
         self.context_selected = 0
         self.option_items: list[tuple[str, str]] = [
+            ("/new <task>", "/new "),
             ("/run <task>", "/run "),
             ("/list", "/list"),
             ("/approvals", "/approvals"),
             ("/show <task_id>", "/show "),
-            ("/hide", "/hide"),
+            ("/log <task_id>", "/log "),
+            ("/finish <task_id>", "/finish "),
             ("/approve <id>", "/approve "),
             ("/deny <id>", "/deny "),
             ("/pause <task_id>", "/pause "),
@@ -226,8 +255,8 @@ class ParagentsTUI:
             ("/cancel <task_id>", "/cancel "),
         ]
         self.option_selected = 0
-        self.logs: list[str] = ["Paragents TUI ready."]
-        self._watch_seen_count: dict[str, int] = {}
+        self.logs: list[str] = [self._format_par("ready")]
+        self._seen_count_by_task: dict[str, int] = {}
         self._watch_phase_by_task: dict[str, str] = {}
         self._pending_approval_by_task: dict[str, str] = {}
         self._side_log_task_id: str | None = None
@@ -237,7 +266,11 @@ class ParagentsTUI:
         self._spinner_idx = 0
         self._side_log_max_width = 88
         self._blink_on = True
-        self._submit_slot_ids: list[str] = []
+        self._task_slot_ids: list[str] = []
+        self._submit_slot_ids: list[str] = self._task_slot_ids
+        self._bound_main_task_id: str | None = None
+        self._watch_pump_task: asyncio.Task[None] | None = None
+        self._max_main_log_lines = 4000
         self.parts = build_tui_layout(
             show_options_filter=Condition(lambda: self.show_options or self.context_popup_mode is not None),
             submit_count_provider=lambda: len(self._submit_task_views()),
@@ -252,24 +285,50 @@ class ParagentsTUI:
         )
         self.app.layout.focus(self.parts.command_bar)
 
+    @property
+    def watching_task_id(self) -> str | None:
+        return self.foreground_task_id
+
+    @watching_task_id.setter
+    def watching_task_id(self, value: str | None) -> None:
+        self.foreground_task_id = value
+
     def _refresh_external_state(self) -> None:
-        if self.watching_task_id_provider is not None:
-            current_watch = self.watching_task_id_provider()
-            if current_watch != self.watching_task_id and self.watching_task_id:
-                self._pending_approval_by_task.pop(self.watching_task_id, None)
-            if current_watch and current_watch not in self._watch_seen_count:
-                self._watch_seen_count[current_watch] = 0
-                self._watch_phase_by_task[current_watch] = "thinking..."
-            self.watching_task_id = current_watch
-            if self.watching_task_id is None:
-                self.watch_source = None
-            elif self.watch_source is None:
-                self.watch_source = "show"
-        if self.submit_slot_ids_provider is not None:
-            next_slots = [tid for tid in self.submit_slot_ids_provider() if tid in self.scheduler.tasks]
-            if self.watching_task_id:
-                next_slots = [tid for tid in next_slots if tid != self.watching_task_id]
-            self._submit_slot_ids = next_slots[:4]
+        if self.foreground_task_id_provider is not None:
+            current = self.foreground_task_id_provider()
+            if current != self.foreground_task_id and self.foreground_task_id:
+                self._pending_approval_by_task.pop(self.foreground_task_id, None)
+            if current and current not in self._seen_count_by_task:
+                self._seen_count_by_task[current] = 0
+                self._watch_phase_by_task[current] = "thinking..."
+            self.foreground_task_id = current
+            self._sync_main_panel_binding()
+        if self.task_slot_ids_provider is not None:
+            next_slots = [tid for tid in self.task_slot_ids_provider() if tid in self.scheduler.tasks]
+            self._task_slot_ids = next_slots[:5]
+
+    def _append_main_log(self, line: str) -> None:
+        self.logs.append(line)
+        overflow = len(self.logs) - self._max_main_log_lines
+        if overflow > 0:
+            del self.logs[:overflow]
+        self._side_log_back_offset = 0
+
+    def _extend_main_logs(self, lines: list[str]) -> None:
+        for line in lines:
+            self._append_main_log(line)
+
+    def _sync_main_panel_binding(self) -> None:
+        target_task_id = self.log_view_task_id or self.foreground_task_id
+        if target_task_id == self._bound_main_task_id:
+            return
+        self._bound_main_task_id = target_task_id
+        # 主面板绑定到新任务时，清空旧任务日志，让旧日志“被带走”。
+        self.logs = [self._format_par("ready")] if target_task_id is None else []
+        if target_task_id is None:
+            return
+        self._seen_count_by_task[target_task_id] = 0
+        self._append_watch_logs()
 
     def _task_ref(self, task_id: str) -> str:
         task = self.scheduler.tasks.get(task_id)
@@ -321,6 +380,23 @@ class ParagentsTUI:
             return " Log Scroll: Fn+↑/Fn+↓ | line: Ctrl+K/Ctrl+J "
         return " Log Scroll: PageUp/PageDown | line: Ctrl+K/Ctrl+J "
 
+    def _truncate_to_display_width(self, text: str, max_width: int) -> str:
+        if max_width <= 0:
+            return ""
+        if get_cwidth(text) <= max_width:
+            return text
+        ellipsis = "..."
+        keep = max(1, max_width - len(ellipsis))
+        out: list[str] = []
+        width = 0
+        for ch in text:
+            w = max(1, get_cwidth(ch))
+            if width + w > keep:
+                break
+            out.append(ch)
+            width += w
+        return "".join(out) + ellipsis
+
     def _on_input_changed(self, _buffer: Buffer) -> None:
         if self.show_options:
             return
@@ -330,14 +406,16 @@ class ParagentsTUI:
         raw = self.input_buffer.text.strip()
         lower = raw.lower()
         mode: str | None = None
-        if re.fullmatch(r"/?ack(?:\s.*)?", lower):
-            mode = "ack"
+        if re.fullmatch(r"/?finish(?:\s.*)?", lower):
+            mode = "finish"
         elif re.fullmatch(r"/?show(?:\s.*)?", lower):
             mode = "show"
         elif re.fullmatch(r"/?approve(?:\s.*)?", lower):
             mode = "approve"
         elif re.fullmatch(r"/?deny(?:\s.*)?", lower):
             mode = "deny"
+        elif raw.startswith("/") and " " not in raw:
+            mode = "slash"
         if mode is None:
             self.context_popup_mode = None
             self.context_candidates = []
@@ -352,8 +430,14 @@ class ParagentsTUI:
         self.context_selected = max(0, min(self.context_selected, len(candidates) - 1))
 
     def _context_candidate_ids(self, mode: str) -> list[tuple[str, str]]:
-        if mode == "ack":
-            provider = self.ack_pending_task_ids_provider
+        if mode == "slash":
+            prefix = self.input_buffer.text.strip().lower()
+            if not prefix.startswith("/"):
+                return []
+            matched = [cmd for cmd in self._slash_commands if cmd.startswith(prefix)]
+            return [(cmd, cmd) for cmd in matched]
+        if mode == "finish":
+            provider = self.finish_candidate_task_ids_provider
             if provider is None:
                 return []
             result: list[tuple[str, str]] = []
@@ -403,7 +487,8 @@ class ParagentsTUI:
             return ""
         inner_width = 52
         title_map = {
-            "ack": " ACK Candidates ",
+            "slash": " COMMAND Candidates ",
+            "finish": " FINISH Candidates ",
             "show": " SHOW Candidates ",
             "approve": " APPROVE Candidates ",
             "deny": " DENY Candidates ",
@@ -442,7 +527,8 @@ class ParagentsTUI:
         idx = max(0, min(self.context_selected, len(self.context_candidates) - 1))
         token, _ = self.context_candidates[idx]
         prefix_map = {
-            "ack": "/ack ",
+            "slash": "",
+            "finish": "/finish ",
             "show": "/show ",
             "approve": "/approve ",
             "deny": "/deny ",
@@ -465,37 +551,91 @@ class ParagentsTUI:
         # Reserve rows for command bar/separators/spinner headroom.
         return max(30, rows - 4)
 
+    def _main_panel_header_line(self) -> str | None:
+        task_id = self.log_view_task_id or self.foreground_task_id
+        if not task_id:
+            return None
+        task = self.scheduler.tasks.get(task_id)
+        if task is None:
+            return None
+        initial = str(getattr(task, "local_state", {}).get("initial_input", "")).strip()
+        raw = (initial or str(getattr(task, "input", "")).strip()).replace("\n", " ")
+        if not raw:
+            return None
+        try:
+            cols = int(self.app.output.get_size().columns)
+        except Exception:
+            cols = 120
+        # Left(main) panel is roughly 7/11 of terminal width.
+        panel_width = max(28, int(cols * (7 / 11)) - 2)
+        prefix = "Task: "
+        text = self._truncate_to_display_width(raw, max(1, panel_width - len(prefix)))
+        return f"{prefix}{text}"
+
     def _main_panel_lines(self) -> list[str]:
-        self._append_watch_logs()
+        self._sync_main_panel_binding()
         lines = list(self.logs)
-        if self.watch_source is not None and self.watching_task_id and self.watching_task_id in self.scheduler.tasks:
-            task = self.scheduler.tasks[self.watching_task_id]
+        if self.foreground_task_id and self.foreground_task_id in self.scheduler.tasks:
+            task = self.scheduler.tasks[self.foreground_task_id]
             task_status = getattr(task, "status", "")
             if task_status in {"running", "pending", "paused"}:
                 self._spinner_idx = (self._spinner_idx + 1) % len(self._spinner_frames)
-                phase = self._watch_phase_by_task.get(self.watching_task_id, "thinking...")
-                task_ref = self._task_ref(self.watching_task_id)
+                phase = self._watch_phase_by_task.get(self.foreground_task_id, "thinking...")
+                task_ref = self._task_ref(self.foreground_task_id)
                 lines.append(f"{self._spinner_frames[self._spinner_idx]} assistant({task_ref}): {phase}")
         return lines
 
+    def _main_panel_wrap_width(self) -> int:
+        default_cols = 120
+        try:
+            cols = int(self.app.output.get_size().columns)
+        except Exception:
+            cols = default_cols
+        weighted = int(cols * (7 / 11)) - 2
+        by_min_right = cols - 53
+        return max(20, min(weighted, by_min_right))
+
+    def _to_visual_lines(self, lines: list[str]) -> list[str]:
+        width = self._main_panel_wrap_width()
+        visual: list[str] = []
+        for raw in lines:
+            line = raw or ""
+            if not line:
+                visual.append("")
+                continue
+            current: list[str] = []
+            current_w = 0
+            for ch in line:
+                ch_w = max(1, get_cwidth(ch))
+                if current and current_w + ch_w > width:
+                    visual.append("".join(current))
+                    current = [ch]
+                    current_w = ch_w
+                else:
+                    current.append(ch)
+                    current_w += ch_w
+            visual.append("".join(current))
+        return visual
+
     def _slice_main_panel_lines(self, lines: list[str]) -> list[str]:
         line_limit = self._log_line_limit()
-        if not lines:
+        visual_lines = self._to_visual_lines(lines)
+        if not visual_lines:
             return []
-        if len(lines) <= line_limit:
-            return lines
-        max_back = max(0, len(lines) - line_limit)
+        if len(visual_lines) <= line_limit:
+            return visual_lines
+        max_back = max(0, len(visual_lines) - line_limit)
         self._side_log_back_offset = max(0, min(self._side_log_back_offset, max_back))
-        end = len(lines) - self._side_log_back_offset
+        end = len(visual_lines) - self._side_log_back_offset
         start = max(0, end - line_limit)
-        return lines[start:end]
+        return visual_lines[start:end]
 
     def _scroll_main_logs(self, delta_lines: int) -> None:
-        all_lines = self._main_panel_lines()
-        if not all_lines:
+        all_visual_lines = self._to_visual_lines(self._main_panel_lines())
+        if not all_visual_lines:
             return
         line_limit = self._log_line_limit()
-        max_back = max(0, len(all_lines) - line_limit)
+        max_back = max(0, len(all_visual_lines) - line_limit)
         self._side_log_back_offset = max(0, min(max_back, self._side_log_back_offset + delta_lines))
 
     def _history_up(self) -> None:
@@ -511,22 +651,46 @@ class ParagentsTUI:
         self._blink_on = not self._blink_on
         if self.show_welcome:
             return self._welcome_text()
-        return "\n".join(self._slice_main_panel_lines(self._main_panel_lines()))
+        lines = self._slice_main_panel_lines(self._main_panel_lines())
+        header = self._main_panel_header_line()
+        if header is None:
+            return "\n".join(lines)
+        body_limit = max(1, self._log_line_limit() - 1)
+        body = lines[-body_limit:] if len(lines) > body_limit else lines
+        return "\n".join([header, *body])
 
     def _log_panel_formatted(self) -> list[tuple[str, str]]:
         text = self._log_panel_text()
         fragments: list[tuple[str, str]] = []
+        approval_active = self._is_current_panel_task_waiting_approval()
         for line in text.splitlines():
-            task_short_id = self._extract_task_short_id(line)
-            if task_short_id:
-                style = self._task_prefix_style(task_short_id)
-                fragments.append((style, f"[{task_short_id}] "))
-                fragments.append(("", line + "\n"))
+            lower = line.lower()
+            if approval_active and ("approval" in lower or "request_id=" in lower) and self._blink_on:
+                fragments.append(("class:status.approval", line + "\n"))
+            elif ("[x failed]" in lower or "failed:" in lower) and self._blink_on:
+                fragments.append(("class:status.failed", line + "\n"))
+            elif ("[! paused]" in lower or " paused" in lower) and self._blink_on:
+                fragments.append(("class:status.paused", line + "\n"))
             else:
                 fragments.append(("", line + "\n"))
         if not fragments:
             fragments.append(("", ""))
         return fragments
+
+    def _is_current_panel_task_waiting_approval(self) -> bool:
+        task_id = self.log_view_task_id or self.foreground_task_id
+        if not task_id:
+            return False
+        task = self.scheduler.tasks.get(task_id)
+        if task is None:
+            return False
+        request_id = str(getattr(task, "local_state", {}).get("pending_approval_request_id", "")).strip()
+        if not request_id:
+            return False
+        if self.approve_candidate_request_refs_provider is None:
+            return True
+        pending_refs = set(self.approve_candidate_request_refs_provider())
+        return self._request_ref(request_id) in pending_refs
 
     def _extract_task_short_id(self, line: str) -> str | None:
         m = re.search(r"assistant\(([0-9a-f]{6})\)", line)
@@ -548,20 +712,30 @@ class ParagentsTUI:
         b = max(90, b)
         return f"fg:#{r:02x}{g:02x}{b:02x} bold"
 
-    def _append_watch_logs(self) -> None:
-        if self.watch_source is None:
-            return
-        if not self.watching_task_id:
-            return
-        if self.watching_task_id not in self.scheduler.tasks:
-            return
-        watch_logs = self.scheduler.get_task_logs(self.watching_task_id, limit=200)
-        seen = self._watch_seen_count.get(self.watching_task_id, 0)
+    def _append_watch_logs(self) -> bool:
+        task_id = self.log_view_task_id or self.foreground_task_id
+        if task_id is None:
+            return False
+        if task_id not in self.scheduler.tasks:
+            return False
+        watch_logs = self.scheduler.get_task_logs(task_id, limit=200)
+        seen = self._seen_count_by_task.get(task_id, 0)
         if seen >= len(watch_logs):
-            return
+            return False
         for line in watch_logs[seen:]:
-            self._ingest_watch_line(self.watching_task_id, line)
-        self._watch_seen_count[self.watching_task_id] = len(watch_logs)
+            self._ingest_watch_line(task_id, line)
+        self._seen_count_by_task[task_id] = len(watch_logs)
+        return True
+
+    async def _watch_log_pump(self) -> None:
+        try:
+            while True:
+                changed = self._append_watch_logs()
+                if changed:
+                    self._request_redraw()
+                await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            return
 
     def _compact_ids_in_text(self, text: str) -> str:
         def _replace_request_id(match: re.Match[str]) -> str:
@@ -591,17 +765,17 @@ class ParagentsTUI:
             return
         if "result:" in line:
             result = line.split("result:", 1)[1].strip()
-            self.logs.append(f"assistant({self._task_ref(task_id)}): {result}")
+            self._append_main_log(self._format_par(f"assistant({self._task_ref(task_id)}): {result}"))
             return
         if "failed:" in line:
             msg = line.split("failed:", 1)[1].strip()
-            self.logs.append(f"[X FAILED] assistant({self._task_ref(task_id)}) error: {msg}")
+            self._append_main_log(self._format_par(f"[X FAILED] assistant({self._task_ref(task_id)}) error: {msg}"))
             return
         if "finished successfully" in line:
-            self.logs.append(f"assistant({self._task_ref(task_id)}): done")
+            self._append_main_log(self._format_par(f"assistant({self._task_ref(task_id)}): done"))
             return
         if "needs approval" in line:
-            self.logs.append(f"[! APPROVAL] assistant({self._task_ref(task_id)}): waiting for approval")
+            self._append_main_log(self._format_par(f"[! APPROVAL] assistant({self._task_ref(task_id)}): waiting for approval"))
             return
         if "waiting for approval request_id=" in line:
             request_id = line.split("request_id=", 1)[1].strip()
@@ -610,17 +784,33 @@ class ParagentsTUI:
                 request_id, detail = request_id.split(" detail=", 1)
                 detail = detail.strip()
             if detail:
-                self.logs.append(f"[! APPROVAL] assistant({self._task_ref(task_id)}): {detail}")
-            self.logs.append(
-                f"[! APPROVAL] assistant({self._task_ref(task_id)}): 权限请求 {self._request_ref(request_id)}，输入 y/n 确认"
+                self._append_main_log(self._format_par(f"[! APPROVAL] assistant({self._task_ref(task_id)}): {detail}"))
+            self._append_main_log(
+                self._format_par(
+                    f"[! APPROVAL] assistant({self._task_ref(task_id)}): 权限请求 {self._request_ref(request_id)}，输入 y/n 确认"
+                )
             )
             self._watch_phase_by_task[task_id] = "waiting approval..."
             self._pending_approval_by_task[task_id] = self._request_ref(request_id)
             return
         if "paused" in line and "approval" not in line.lower():
-            self.logs.append(f"[! PAUSED] [watch:{self._task_ref(task_id)}] {line}")
+            self._append_main_log(self._format_par(f"[! PAUSED] {line}"))
             return
-        self.logs.append(f"[watch:{self._task_ref(task_id)}] {line}")
+        self._append_main_log(self._format_par(line))
+
+    def _strip_timestamp(self, line: str) -> str:
+        return re.sub(r"^\[\d{2}:\d{2}:\d{2}\]\s*", "", line).strip()
+
+    def _with_timestamp(self, line: str) -> str:
+        content = self._strip_timestamp(line)
+        ts = time.strftime("%H:%M:%S")
+        return f"[{ts}] {content}"
+
+    def _format_you(self, line: str) -> str:
+        return self._with_timestamp(f"you: {self._strip_timestamp(line)}")
+
+    def _format_par(self, line: str) -> str:
+        return self._with_timestamp(f"par: {self._strip_timestamp(line)}")
 
     def _resolve_task_id_token(self, token: str) -> str | None:
         raw = token.strip()
@@ -648,8 +838,9 @@ class ParagentsTUI:
             "║                     Claude-like TUI                      ║\n"
             "╠══════════════════════════════════════════════════════════╣\n"
             "║ Welcome. Type command and press Enter.                   ║\n"
-            "║ Capacity: submit<=4, foreground-watch<=1 (4+1)           ║\n"
-            "║ /show <id> -> foreground watch | /hide -> background run ║\n"
+            "║ Capacity: total task slots <= 5                          ║\n"
+            "║ /show|/resume -> foreground | /log -> readonly history   ║\n"
+            "║ /finish <id> is required to release a task slot          ║\n"
             "║ Tab complete | Up/Down history | Ctrl+O menu             ║\n"
             "║ Ctrl+C exit | Esc close welcome                          ║\n"
             "╚══════════════════════════════════════════════════════════╝"
@@ -684,9 +875,9 @@ class ParagentsTUI:
         self._refresh_external_state()
         logs_by_task = {tid: self.scheduler.get_task_logs(tid, limit=2000) for tid in self.scheduler.tasks}
         views = build_task_views(self.scheduler.tasks, logs_by_task)
-        if self.watching_task_id:
-            views = [v for v in views if v.task_id != self.watching_task_id]
-        views = [v for v in views if v.task_id in self._submit_slot_ids]
+        if self.foreground_task_id:
+            views = [v for v in views if v.task_id != self.foreground_task_id]
+        views = [v for v in views if v.task_id in self._task_slot_ids]
         return views[:4]
 
     def _submit_panel_layout_hint(self, count: int, idx: int) -> str:
@@ -706,7 +897,7 @@ class ParagentsTUI:
         if status == "completed":
             return ("[✓ ACK]", "class:status.completed_ack" if self._blink_on else "")
         if status == "paused":
-            if pending_request_id or "approval" in lower or "request_id=" in lower:
+            if self._is_request_still_pending(pending_request_id):
                 return ("[! APPROVAL]", "class:status.approval" if self._blink_on else "")
             return ("[! PAUSED]", "class:status.paused" if self._blink_on else "")
         if status == "pending":
@@ -715,6 +906,15 @@ class ParagentsTUI:
             return ("[RUNNING]", "")
         return ("[RUNNING]", "")
 
+    def _is_request_still_pending(self, request_id: str) -> bool:
+        rid = request_id.strip()
+        if not rid:
+            return False
+        if self.approve_candidate_request_refs_provider is None:
+            return True
+        pending_refs = set(self.approve_candidate_request_refs_provider())
+        return self._request_ref(rid) in pending_refs
+
     def _submit_panel_text(self, idx: int) -> str:
         views = self._submit_task_views()
         if idx >= len(views):
@@ -722,19 +922,37 @@ class ParagentsTUI:
         v = views[idx]
         marker, _ = self._attention_marker(v.status, v.latest_log, v.pending_approval_request_id)
         layout_hint = self._submit_panel_layout_hint(len(views), idx)
-        task_name = self.scheduler.tasks.get(v.task_id).input if self.scheduler.tasks.get(v.task_id) else ""
+        task_obj = self.scheduler.tasks.get(v.task_id)
+        initial = str(getattr(task_obj, "local_state", {}).get("initial_input", "")) if task_obj is not None else ""
+        task_name = initial or (task_obj.input if task_obj is not None else "")
         task_name = task_name.strip().replace("\n", " ")
-        if len(task_name) > 26:
-            task_name = task_name[:23] + "..."
+
+        panel_count = max(1, len(views))
+        try:
+            cols = int(self.app.output.get_size().columns)
+        except Exception:
+            cols = 120
+        right_col_width = max(42, int(cols * (3 / 11)))
+        if panel_count == 1:
+            submit_width = right_col_width - 2
+        elif panel_count == 2:
+            submit_width = right_col_width - 2
+        elif panel_count == 3:
+            submit_width = max(20, (right_col_width - 1) // 2)
+        else:
+            submit_width = max(20, (right_col_width - 1) // 2)
+        task_name = self._truncate_to_display_width(task_name or "(unnamed)", max(10, submit_width - 2))
+
         def _clip_submit_line(text: str) -> str:
-            if len(text) > 72:
-                return text[:69] + "..."
-            return text
+            # Keep more content for key-step and approval lines; panel already wraps.
+            if "request_id=" in text or "tool call" in text or "tool observation" in text:
+                return self._truncate_to_display_width(text, max(48, submit_width * 3))
+            return self._truncate_to_display_width(text, max(36, submit_width * 2))
 
         key_logs = [_clip_submit_line(self._compact_ids_in_text(line.strip())) for line in v.key_logs if line.strip()]
         key_logs_text = "\n".join(key_logs) if key_logs else _clip_submit_line(self._compact_ids_in_text((v.latest_log or "").strip()))
         return (
-            f"Submit-{idx + 1} ({layout_hint}) {task_name or '(unnamed)'}\n"
+            f"{task_name}\n"
             f"{marker} {self._task_ref(v.task_id)}  r={v.retries}\n"
             f"status={v.status}\n"
             f"{key_logs_text or '(no logs)'}"
@@ -750,7 +968,7 @@ class ParagentsTUI:
         lines = text.splitlines()
         fragments: list[tuple[str, str]] = []
         request_line_style = ""
-        if v.status == "paused" and v.pending_approval_request_id:
+        if v.status == "paused" and self._is_request_still_pending(v.pending_approval_request_id):
             request_line_style = "class:status.approval" if self._blink_on else ""
         for line_idx, line in enumerate(lines):
             if line_idx == 1 and style:
@@ -841,9 +1059,10 @@ class ParagentsTUI:
                 self._apply_selected_option()
                 return
             if self.context_popup_mode is not None:
-                self._apply_context_selection()
-                event.app.layout.focus(self.parts.command_bar)
-                return
+                if self.context_candidates:
+                    self._apply_context_selection()
+                    event.app.layout.focus(self.parts.command_bar)
+                    return
             if not event.app.layout.has_focus(self.parts.command_bar):
                 event.app.layout.focus(self.parts.command_bar)
                 return
@@ -855,7 +1074,9 @@ class ParagentsTUI:
             self.show_welcome = False
             if cmd:
                 display = raw if raw else cmd
-                self.logs.append(f"You: {display}")
+                # submit 是后台任务提交，不污染 foreground 主面板日志。
+                if not cmd.startswith("submit "):
+                    self._append_main_log(self._format_you(display))
                 if cmd in {"quit", "exit"}:
                     event.app.exit()
                 else:
@@ -906,89 +1127,49 @@ class ParagentsTUI:
         return kb
 
     async def _run_command(self, cmd: str) -> None:
-        prev_watching_task_id = self.watching_task_id
-        if cmd.startswith("submit ") and self.watch_source == "run":
-            # submit 模式默认不应继续占用主面板自动 watch
-            self.watching_task_id = None
-            self.watch_source = None
         output = await self.command_handler(cmd)
-        if self.watching_task_id_provider is not None or self.submit_slot_ids_provider is not None:
+        if self.foreground_task_id_provider is not None or self.task_slot_ids_provider is not None:
             self._refresh_external_state()
-        else:
-            self._update_watch_state(cmd, output)
-            self._sync_submit_slots_from_output(cmd, output, prev_watching_task_id)
-        if cmd in {"y", "n"} and self.watching_task_id:
-            self._pending_approval_by_task.pop(self.watching_task_id, None)
+        if cmd in {"y", "n"} and self.foreground_task_id:
+            self._pending_approval_by_task.pop(self.foreground_task_id, None)
         if output and output[0] == "unknown command":
             output = [
                 f"不支持的指令: {cmd}",
-                "可用命令: /run, /list, /show, /hide, /approvals, /approve, /deny, /pause, /resume, /cancel, /quit",
-                "提示: 普通语句会自动当作 /run <语句>。",
+                "可用命令: /new, /run, /submit, /list, /show, /log, /finish, /approvals, /approve, /deny, /pause, /resume, /cancel, /quit",
+                "提示: 非 / 开头输入会自动按有无 foreground 映射为 /new 或 /run。",
             ]
-        if cmd.startswith("run "):
-            self.logs.extend(self._shorten_ids(output if output else ["(no output)"]))
-            self.app.layout.focus(self.parts.command_bar)
-            return
-        self.logs.extend(self._shorten_ids(output if output else ["(no output)"]))
+        # submit 的结果只体现在 submit 面板；主面板保持 foreground 纯净。
+        if not cmd.startswith("submit "):
+            lines = self._shorten_ids(output if output else ["(no output)"])
+            lines = [line for line in lines if not line.startswith("continued in foreground:")]
+            self._extend_main_logs([self._format_par(line) for line in lines])
+        self._request_redraw()
         self.app.layout.focus(self.parts.command_bar)
 
-    def _sync_submit_slots_from_output(self, cmd: str, output: list[str], prev_watching_task_id: str | None) -> None:
-        for task_id in list(self._submit_slot_ids):
-            if task_id not in self.scheduler.tasks:
-                self._submit_slot_ids.remove(task_id)
-        if cmd.startswith("submit "):
-            for line in output:
-                if line.startswith("submitted: "):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        task_id = self._resolve_task_id_token(parts[1]) or parts[1]
-                        if task_id in self.scheduler.tasks and task_id not in self._submit_slot_ids:
-                            self._submit_slot_ids.append(task_id)
-        if cmd.startswith("run ") or cmd.startswith("show "):
-            if self.watching_task_id and self.watching_task_id in self._submit_slot_ids:
-                self._submit_slot_ids.remove(self.watching_task_id)
-        if cmd in {"hide", "h"}:
-            if prev_watching_task_id and prev_watching_task_id in self.scheduler.tasks and prev_watching_task_id not in self._submit_slot_ids:
-                task = self.scheduler.tasks[prev_watching_task_id]
-                if getattr(task, "status", "") not in {"completed", "failed", "cancelled"}:
-                    self._submit_slot_ids.append(prev_watching_task_id)
-        for line in output:
-            m = re.search(r"已知悉任务 ([0-9a-f]{6}(?:,\s*[0-9a-f]{6})*)", line)
-            if not m:
-                continue
-            shorts = [x.strip() for x in m.group(1).split(",")]
-            self._submit_slot_ids = [tid for tid in self._submit_slot_ids if self._task_ref(tid) not in shorts]
+    def _request_redraw(self) -> None:
+        try:
+            self.app.invalidate()
+        except Exception:
+            pass
 
+    # Backward-compatible helper for older tests/tools.
     def _update_watch_state(self, cmd: str, output: list[str]) -> None:
         if cmd.startswith("run "):
             for line in output:
                 if line.startswith("submitted: "):
                     parts = line.split()
                     if len(parts) >= 2:
-                        resolved_task_id = self._resolve_task_id_token(parts[1])
-                        if not resolved_task_id:
-                            continue
-                        self.watching_task_id = resolved_task_id
-                        self.watch_source = "run"
-                        self._watch_seen_count[self.watching_task_id] = 0
-                        self._watch_phase_by_task[self.watching_task_id] = "thinking..."
-                        self._pending_approval_by_task.pop(self.watching_task_id, None)
-                        return
+                        task_id = self._resolve_task_id_token(parts[1])
+                        if task_id:
+                            self.foreground_task_id = task_id
+                            self.log_view_task_id = None
+                            return
         if cmd.startswith("show "):
-            resolved_task_id = self._resolve_task_id_token(cmd.split(" ", 1)[1].strip())
-            if not resolved_task_id:
-                return
-            self.watching_task_id = resolved_task_id
-            self.watch_source = "show"
-            self._watch_seen_count[self.watching_task_id] = 0
-            return
-        if cmd == "show" and self.watching_task_id and output:
-            return
-        if cmd in {"hide", "h"}:
-            if self.watching_task_id:
-                self._pending_approval_by_task.pop(self.watching_task_id, None)
-            self.watching_task_id = None
-            self.watch_source = None
+            token = cmd.split(" ", 1)[1].strip()
+            task_id = self._resolve_task_id_token(token)
+            if task_id:
+                self.foreground_task_id = task_id
+                self.log_view_task_id = None
 
     def _handle_option_digit(self, digit: str) -> None:
         if not self.show_options:
@@ -1012,16 +1193,24 @@ class ParagentsTUI:
         return [re.sub(r"\b[0-9a-f]{8}-[0-9a-f-]{27}\b", lambda m: m.group(0)[:6], line) for line in lines]
 
     async def run_async(self) -> None:
-        await self.app.run_async()
+        self._watch_pump_task = asyncio.create_task(self._watch_log_pump())
+        try:
+            await self.app.run_async()
+        finally:
+            if self._watch_pump_task is not None:
+                self._watch_pump_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._watch_pump_task
+                self._watch_pump_task = None
 
 
 async def run_tui(
     scheduler: Scheduler,
     pending_approvals_provider: Callable[[], int],
     command_handler: Callable[[str], Awaitable[list[str]]],
-    watching_task_id_provider: Callable[[], str | None] | None = None,
-    submit_slot_ids_provider: Callable[[], list[str]] | None = None,
-    ack_pending_task_ids_provider: Callable[[], list[str]] | None = None,
+    foreground_task_id_provider: Callable[[], str | None] | None = None,
+    task_slot_ids_provider: Callable[[], list[str]] | None = None,
+    finish_candidate_task_ids_provider: Callable[[], list[str]] | None = None,
     show_candidate_task_ids_provider: Callable[[], list[str]] | None = None,
     approve_candidate_request_refs_provider: Callable[[], list[str]] | None = None,
     deny_candidate_request_refs_provider: Callable[[], list[str]] | None = None,
@@ -1031,9 +1220,9 @@ async def run_tui(
         scheduler=scheduler,
         pending_approvals_provider=pending_approvals_provider,
         command_handler=command_handler,
-        watching_task_id_provider=watching_task_id_provider,
-        submit_slot_ids_provider=submit_slot_ids_provider,
-        ack_pending_task_ids_provider=ack_pending_task_ids_provider,
+        foreground_task_id_provider=foreground_task_id_provider,
+        task_slot_ids_provider=task_slot_ids_provider,
+        finish_candidate_task_ids_provider=finish_candidate_task_ids_provider,
         show_candidate_task_ids_provider=show_candidate_task_ids_provider,
         approve_candidate_request_refs_provider=approve_candidate_request_refs_provider,
         deny_candidate_request_refs_provider=deny_candidate_request_refs_provider,

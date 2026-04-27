@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import time
 import uuid
 from typing import Any
@@ -30,6 +31,7 @@ class Scheduler:
         self._dispatch_task: asyncio.Task[None] | None = None
         self._scheduled_handles: dict[str, asyncio.Task[None]] = {}
         self._scheduled_meta: dict[str, float] = {}
+        self._debug_enabled = os.getenv("PARAGENTS_TUI_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
 
     @property
     def tasks(self) -> dict[str, Task]:
@@ -99,11 +101,29 @@ class Scheduler:
         existing_refs = {t.task_ref for t in self._tasks.values()}
         task_ref = generate_short_ref(existing_refs, length=6)
         task = Task(task_id=task_id, input=user_input, task_ref=task_ref, status="pending")
+        task.local_state.setdefault("initial_input", user_input)
         self._tasks[task_id] = task
         self._task_tools[task_id] = tools
         self._publish_log(task_id, "submitted")
         await self._pending_queue.put(task_id)
         return task_id
+
+    async def continue_task(self, task_id: str, user_input: str) -> bool:
+        task = self._tasks.get(task_id)
+        if task is None:
+            return False
+        if task.status in {"running", "pending", "paused"}:
+            return False
+        task.local_state.setdefault("initial_input", task.input)
+        task.input = user_input
+        task.result = None
+        task.error = None
+        task.status = "pending"
+        task.touch()
+        if self._debug_enabled:
+            self._publish_log(task_id, f"continued: {user_input}")
+        await self._pending_queue.put(task_id)
+        return True
 
     async def cancel(self, task_id: str) -> None:
         task = self._tasks.get(task_id)

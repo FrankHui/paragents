@@ -92,7 +92,7 @@ def normalize_tui_command(cmd: str) -> str:
         return cmd[1:].strip()
     if cmd.startswith("submit "):
         return cmd
-    return "run " + cmd
+    return cmd
 
 
 def render_task_list(views: list[TaskView]) -> str:

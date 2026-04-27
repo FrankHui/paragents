@@ -52,10 +52,13 @@ def _print_help() -> None:
     print("  普通语句             自动按 /run <语句> 处理")
     print("")
     print("Commands (/前缀):")
-    print("  /run <text>           Submit and live-watch task")
+    print("  /new <text>           新建 foreground 任务")
+    print("  /run <text>           在当前 foreground 任务上续跑（需任务空闲）")
+    print("  /submit <text>        提交后台任务")
     print("  /list                 List tasks")
-    print("  /show <task_id>       Show live logs for hidden task")
-    print("  /hide                 Hide current watched task")
+    print("  /show <task_id>       切换 foreground 到指定任务")
+    print("  /log <task_id>        只读查看任务日志（不占 foreground）")
+    print("  /finish <task_id>     通知任务结束并释放槽位")
     print("  /cancel <task_id>     Cancel task")
     print("  /pause <task_id>      Pause task")
     print("  /resume <task_id>     Resume paused task")
@@ -72,9 +75,8 @@ def _print_help() -> None:
     print("  /quit                 Exit")
     print("")
     print("运行模型：")
-    print("  submit 槽位最多 4 个，foreground watch 槽位最多 1 个（4+1 限制）")
-    print("  /show <task_id> 进入前台观察模式（foreground watch）")
-    print("  /hide 将观察任务切回后台运行（background run）")
+    print("  总槽位最多 5 个（包含 foreground 与后台任务）")
+    print("  非 / 开头输入默认按 /run <text> 处理")
     print("")
     print("审批提示：")
     print("  /run 触发审批时，可直接输入 y/n + 回车确认。")
@@ -91,24 +93,36 @@ def _normalize_user_input(raw: str) -> str:
         return cmd.lower()
     if cmd.startswith("/"):
         return cmd[1:].strip()
-    if cmd.startswith("submit "):
+    if cmd.startswith("submit ") or cmd.startswith("/submit "):
         return cmd
-    return "run " + cmd
+    return cmd
 
 
-def _parse_submit(cmd: str) -> tuple[bool, str] | None:
-    if cmd.startswith("run "):
-        return True, cmd[len("run ") :].strip()
+def _parse_submit(cmd: str) -> str | None:
     if not cmd.startswith("submit "):
         return None
     body = cmd[len("submit ") :].strip()
     if not body:
         return None
-    if body.startswith("-v "):
-        return True, body[len("-v ") :].strip()
-    if body.startswith("--watch "):
-        return True, body[len("--watch ") :].strip()
-    return False, body
+    return body
+
+
+def _parse_new(cmd: str) -> str | None:
+    if not cmd.startswith("new "):
+        return None
+    body = cmd[len("new ") :].strip()
+    if not body:
+        return None
+    return body
+
+
+def _parse_run(cmd: str) -> str | None:
+    if not cmd.startswith("run "):
+        return None
+    body = cmd[len("run ") :].strip()
+    if not body:
+        return None
+    return body
 
 
 async def _watch_task_logs(scheduler: Scheduler, task_id: str, replay: bool = True) -> None:
@@ -362,10 +376,13 @@ async def _run_cli() -> None:
 
 def _setup_readline() -> None:
     commands = [
+        "/new",
         "/run",
+        "/submit",
         "/list",
         "/show",
-        "/hide",
+        "/log",
+        "/finish",
         "/cancel",
         "/pause",
         "/resume",
@@ -413,7 +430,7 @@ def _parse_page_size(cmd: str) -> tuple[int, int]:
     return page, size
 
 
-def _parse_ack_indices(raw: str) -> list[int]:
+def _parse_finish_indices(raw: str) -> list[int]:
     text = raw.strip()
     if not text:
         return []
@@ -432,6 +449,11 @@ def _parse_ack_indices(raw: str) -> list[int]:
             result.append(idx)
             seen.add(idx)
     return result
+
+
+def _parse_ack_indices(raw: str) -> list[int]:
+    # Backward-compatible alias.
+    return _parse_finish_indices(raw)
 
 
 def _resolve_request_id_from_approve_cmd(
@@ -608,11 +630,11 @@ async def _run_tui_mode() -> None:
     scheduler = Scheduler(llm_client=llm_client, max_in_flight=6)
     await scheduler.start()
     mcp_registry = MCPRegistry()
-    watching_task_id: str | None = None
-    run_task_id: str | None = None
+    foreground_task_id: str | None = None
+    log_task_id: str | None = None
     pending_run_request_id: str | None = None
-    submit_task_slots: list[str] = []
-    ack_pending_submit_tasks: list[str] = []
+    task_slots: list[str] = []
+    finished_task_ids: set[str] = set()
 
     async def _submit_subagent(input_text: str, tools: dict[str, Any]) -> str:
         return await scheduler.submit(input_text, tools=tools)
@@ -628,90 +650,114 @@ async def _run_tui_mode() -> None:
             cancel_scheduled_task=scheduler.cancel_scheduled_task,
         )
 
-    def _refresh_submit_task_state() -> None:
-        terminal_states = {"completed", "failed", "cancelled"}
-        valid_submit_tasks = [tid for tid in submit_task_slots if tid in scheduler.tasks]
-        submit_task_slots[:] = valid_submit_tasks
-        ack_pending_submit_tasks[:] = [tid for tid in ack_pending_submit_tasks if tid in valid_submit_tasks]
-        for task_id in valid_submit_tasks:
-            task = scheduler.tasks[task_id]
-            if task.status in terminal_states:
-                if task_id not in ack_pending_submit_tasks:
-                    ack_pending_submit_tasks.append(task_id)
-            elif task_id in ack_pending_submit_tasks:
-                ack_pending_submit_tasks.remove(task_id)
-        if watching_task_id in submit_task_slots:
-            submit_task_slots.remove(watching_task_id)
-        if watching_task_id in ack_pending_submit_tasks:
-            ack_pending_submit_tasks.remove(watching_task_id)
+    def _refresh_task_state() -> None:
+        nonlocal foreground_task_id, log_task_id
+        valid = [tid for tid in task_slots if tid in scheduler.tasks]
+        task_slots[:] = valid[:5]
+        finished_task_ids.intersection_update(set(task_slots))
+        if foreground_task_id not in task_slots:
+            foreground_task_id = None
+        if log_task_id not in task_slots:
+            log_task_id = None
 
-    def _ack_prompt_lines() -> list[str]:
-        if not ack_pending_submit_tasks:
-            return ["当前没有待知悉完成任务。"]
-        lines = ["有任务已完成但未知悉，需先输入编号释放 submit 坑位："]
-        for idx, task_id in enumerate(ack_pending_submit_tasks, start=1):
+    def _finish_prompt_lines() -> list[str]:
+        if not task_slots:
+            return ["当前没有可 finish 的任务。"]
+        lines = ["可 finish 任务："]
+        for idx, task_id in enumerate(task_slots, start=1):
             lines.append(f"{idx}) {_task_ref(scheduler.tasks, task_id)}")
         lines.append("支持批量输入，例如: 1/2")
-        lines.append("或使用: /ack <task_id前6位>")
+        lines.append("或使用: /finish <task_id前6位>")
         return lines
 
-    def _resolve_submit_task_slot_id(task_id_input: str) -> str | None:
+    def _resolve_slot_task_id(task_id_input: str) -> str | None:
         raw = task_id_input.strip()
         if not raw:
             return None
-        if raw in submit_task_slots:
+        if raw in task_slots:
             return raw
-        ref_exact = [tid for tid in submit_task_slots if _task_ref(scheduler.tasks, tid) == raw]
+        ref_exact = [tid for tid in task_slots if _task_ref(scheduler.tasks, tid) == raw]
         if len(ref_exact) == 1:
             return ref_exact[0]
-        matched = [tid for tid in submit_task_slots if tid.startswith(raw)]
+        matched = [tid for tid in task_slots if tid.startswith(raw)]
         if len(matched) == 1:
             return matched[0]
-        ref_prefix = [tid for tid in submit_task_slots if _task_ref(scheduler.tasks, tid).startswith(raw)]
+        ref_prefix = [tid for tid in task_slots if _task_ref(scheduler.tasks, tid).startswith(raw)]
         if len(ref_prefix) == 1:
             return ref_prefix[0]
         return None
 
     async def _handle_cmd(cmd: str) -> list[str]:
-        nonlocal watching_task_id, run_task_id, pending_run_request_id
+        nonlocal foreground_task_id, log_task_id, pending_run_request_id
         out: list[str] = []
-        _refresh_submit_task_state()
-        if not _is_watch_slot_blocking(scheduler, watching_task_id):
-            watching_task_id = None
+        _refresh_task_state()
         pending_ids_before = [(req.request_id, req.request_ref) for req in permission_manager.list_pending()]
-        pending_run_request_id = _get_active_approval_request_id(scheduler, run_task_id, watching_task_id)
+        pending_run_request_id = _get_active_approval_request_id(scheduler, foreground_task_id, foreground_task_id)
         if cmd in {"y", "n"} and pending_run_request_id:
             return await _handle_run_approval_answer(cmd, pending_run_request_id, permission_manager, scheduler)
-        if cmd.startswith("ack "):
-            _refresh_submit_task_state()
+        known_prefixes = (
+            "new ",
+            "run ",
+            "submit ",
+            "list",
+            "show ",
+            "show",
+            "log ",
+            "resume ",
+            "finish ",
+            "approvals",
+            "approve ",
+            "deny ",
+            "cancel ",
+            "pause ",
+            "retry ",
+            "schedule ",
+            "schedules",
+            "cancel-schedule ",
+            "setup",
+            "show-config",
+            "permissions",
+            "help",
+            "quit",
+            "exit",
+            "y",
+            "n",
+        )
+        if not cmd.startswith(known_prefixes):
+            cmd = f"{'run' if foreground_task_id else 'new'} {cmd}"
+        if cmd.startswith("finish "):
+            _refresh_task_state()
             raw_task_id = cmd.split(" ", 1)[1].strip()
-            target_task_id = _resolve_submit_task_slot_id(raw_task_id)
+            target_task_id = _resolve_slot_task_id(raw_task_id)
             if not target_task_id:
                 return [
-                    f"未找到可知悉任务: {raw_task_id}",
-                    *_ack_prompt_lines(),
+                    f"未找到可 finish 任务: {raw_task_id}",
+                    *_finish_prompt_lines(),
                 ]
-            if target_task_id not in ack_pending_submit_tasks:
-                return [f"任务 {_task_ref(scheduler.tasks, target_task_id)} 当前不是待知悉状态。"]
-            ack_pending_submit_tasks.remove(target_task_id)
-            if target_task_id in submit_task_slots:
-                submit_task_slots.remove(target_task_id)
-            return [f"已知悉任务 {_task_ref(scheduler.tasks, target_task_id)}，已释放 submit 坑位。"]
-        ack_indices = _parse_ack_indices(cmd)
-        if ack_indices:
-            _refresh_submit_task_state()
-            if not ack_pending_submit_tasks:
-                return ["当前没有待知悉完成任务。"]
-            if max(ack_indices) > len(ack_pending_submit_tasks):
-                return _ack_prompt_lines()
-            target_ids = [ack_pending_submit_tasks[idx - 1] for idx in ack_indices]
+            finished_task_ids.add(target_task_id)
+            if target_task_id in task_slots:
+                task_slots.remove(target_task_id)
+            if foreground_task_id == target_task_id:
+                foreground_task_id = None
+                log_task_id = None
+            return [f"已 finish 任务 {_task_ref(scheduler.tasks, target_task_id)}，已释放槽位。"]
+        finish_indices = _parse_finish_indices(cmd)
+        if finish_indices:
+            _refresh_task_state()
+            if not task_slots:
+                return ["当前没有可 finish 任务。"]
+            if max(finish_indices) > len(task_slots):
+                return _finish_prompt_lines()
+            target_ids = [task_slots[idx - 1] for idx in finish_indices]
             for task_id in target_ids:
-                if task_id in ack_pending_submit_tasks:
-                    ack_pending_submit_tasks.remove(task_id)
-                if task_id in submit_task_slots:
-                    submit_task_slots.remove(task_id)
+                finished_task_ids.add(task_id)
+                if task_id in task_slots:
+                    task_slots.remove(task_id)
+                if foreground_task_id == task_id:
+                    foreground_task_id = None
+                    log_task_id = None
             released = ", ".join(_task_ref(scheduler.tasks, task_id) for task_id in target_ids)
-            return [f"已知悉任务 {released}，已释放 submit 坑位。"]
+            return [f"已 finish 任务 {released}，已释放槽位。"]
         handled, lines = handle_approval_command(cmd, permission_manager)
         if handled:
             out.extend(lines)
@@ -730,38 +776,47 @@ async def _run_tui_mode() -> None:
                     if failed:
                         out.append("failed tasks: " + ", ".join(_task_ref(scheduler.tasks, task_id) for task_id in failed))
             return out
-        parsed = _parse_submit(cmd)
-        if parsed is not None:
-            watch_mode, content = parsed
+        new_content = _parse_new(cmd)
+        if new_content is not None:
+            _refresh_task_state()
+            if len(task_slots) >= 5:
+                return ["任务槽位已满（最多 5 个），请先 /finish 释放后再运行。", *_finish_prompt_lines()]
+            task_id = await scheduler.submit(new_content, tools=_build_main_tools())
+            if task_id not in task_slots:
+                task_slots.append(task_id)
+            foreground_task_id = task_id
+            log_task_id = None
+            pending_run_request_id = None
+            return [f"submitted: {_task_ref(scheduler.tasks, task_id)} (foreground)"]
+
+        run_content = _parse_run(cmd)
+        if run_content is not None:
+            _refresh_task_state()
+            if foreground_task_id is None:
+                return ["当前没有 foreground 任务，请使用 /new <text> 新建任务。"]
+            fg_task = scheduler.tasks.get(foreground_task_id)
+            fg_status = str(getattr(fg_task, "status", "")) if fg_task is not None else ""
+            if fg_status in {"running", "pending", "paused"}:
+                return [f"foreground 任务 {_task_ref(scheduler.tasks, foreground_task_id)} 正在执行中，当前不可 /run 新序列。"]
+            ok = await scheduler.continue_task(foreground_task_id, run_content)
+            if not ok:
+                return [f"foreground 任务 {_task_ref(scheduler.tasks, foreground_task_id)} 当前不可续跑。"]
+            log_task_id = None
+            pending_run_request_id = None
+            return [f"continued in foreground: {_task_ref(scheduler.tasks, foreground_task_id)}"]
+
+        submit_content = _parse_submit(cmd)
+        if submit_content is not None:
+            content = submit_content
             if not content:
-                return ["run content is empty" if cmd.startswith("run ") else "submit content is empty"]
-            _refresh_submit_task_state()
-            if watch_mode and _is_watch_slot_blocking(scheduler, watching_task_id):
-                return [
-                    f"当前已有 foreground watch 任务: {_task_ref(scheduler.tasks, watching_task_id)}",
-                    "请先执行 /hide 将其切回 background run，再发起新的 /run 或 /show。",
-                ]
-            if not watch_mode and len(submit_task_slots) >= 4:
-                if ack_pending_submit_tasks:
-                    return [
-                        "submit 坑位已满，且存在未知悉完成任务。",
-                        *_ack_prompt_lines(),
-                    ]
-                return ["submit 坑位已满（最多 4 个），请稍后再试。"]
+                return ["submit content is empty"]
+            _refresh_task_state()
+            if len(task_slots) >= 5:
+                return ["任务槽位已满（最多 5 个），请先 /finish 释放后再提交。", *_finish_prompt_lines()]
             task_id = await scheduler.submit(content, tools=_build_main_tools())
-            out.append("submitted: " + _task_ref(scheduler.tasks, task_id) + (" (watching)" if watch_mode else " (quiet)"))
-            if watch_mode:
-                watching_task_id = task_id
-                if task_id in submit_task_slots:
-                    submit_task_slots.remove(task_id)
-                if task_id in ack_pending_submit_tasks:
-                    ack_pending_submit_tasks.remove(task_id)
-            else:
-                if task_id not in submit_task_slots:
-                    submit_task_slots.append(task_id)
-            if cmd.startswith("run "):
-                run_task_id = task_id
-                pending_run_request_id = None
+            if task_id not in task_slots:
+                task_slots.append(task_id)
+            out.append("submitted: " + _task_ref(scheduler.tasks, task_id) + " (background)")
             return out
         if cmd == "list" or cmd.startswith("list "):
             if not scheduler.tasks:
@@ -769,32 +824,28 @@ async def _run_tui_mode() -> None:
             page, size = _parse_page_size(cmd)
             lines = format_task_table(scheduler.tasks).splitlines()
             return paginate_lines(lines, page=page, size=size)
-        if cmd == "show" and watching_task_id:
-            return scheduler.get_task_logs(watching_task_id, limit=30)
+        if cmd == "show" and foreground_task_id:
+            return scheduler.get_task_logs(foreground_task_id, limit=30)
         if cmd.startswith("show "):
             raw_task_id = cmd.split(" ", 1)[1].strip()
             task_id, err = _resolve_task_id(raw_task_id, scheduler.tasks)
             if task_id is None:
                 return [err or "task not found"]
-            if _is_watch_slot_blocking(scheduler, watching_task_id) and watching_task_id != task_id:
-                return [
-                    f"当前已有 foreground watch 任务: {_task_ref(scheduler.tasks, watching_task_id)}",
-                    "请先执行 /hide 将其切回 background run，再切换 /show。",
-                ]
-            watching_task_id = task_id
+            if task_id in finished_task_ids:
+                return [f"任务 {_task_ref(scheduler.tasks, task_id)} 已 finish 并释放，不支持 /show。"]
+            foreground_task_id = task_id
+            log_task_id = None
             logs = scheduler.get_task_logs(task_id, limit=30)
-            return [f"switched to foreground watch: {_task_ref(scheduler.tasks, task_id)}", *logs]
-        if cmd in {"hide", "h"}:
-            _refresh_submit_task_state()
-            if watching_task_id and watching_task_id in scheduler.tasks and watching_task_id not in submit_task_slots:
-                if len(submit_task_slots) >= 4:
-                    lines = ["watch 已隐藏，但 submit 坑位已满，暂未回收为 submit 面板。"]
-                    if ack_pending_submit_tasks:
-                        lines.extend(_ack_prompt_lines())
-                    return lines
-                submit_task_slots.append(watching_task_id)
-            watching_task_id = None
-            return ["switched to background run mode"]
+            return [f"switched to foreground: {_task_ref(scheduler.tasks, task_id)}", *logs]
+        if cmd.startswith("log "):
+            raw_task_id = cmd.split(" ", 1)[1].strip()
+            task_id, err = _resolve_task_id(raw_task_id, scheduler.tasks)
+            if task_id is None:
+                return [err or "task not found"]
+            foreground_task_id = None
+            log_task_id = task_id
+            logs = scheduler.get_task_logs(task_id, limit=30)
+            return [f"readonly log view: {_task_ref(scheduler.tasks, task_id)}", *logs]
         if cmd.startswith("cancel "):
             await scheduler.cancel(cmd.split(" ", 1)[1].strip())
             return ["cancel signal sent"]
@@ -803,27 +854,25 @@ async def _run_tui_mode() -> None:
             _refresh_submit_task_state()
             return ["paused"]
         if cmd.startswith("resume "):
-            await scheduler.resume(cmd.split(" ", 1)[1].strip())
-            _refresh_submit_task_state()
-            return ["resumed"]
+            raw_task_id = cmd.split(" ", 1)[1].strip()
+            task_id, err = _resolve_task_id(raw_task_id, scheduler.tasks)
+            if task_id is None:
+                return [err or "task not found"]
+            if task_id in finished_task_ids:
+                return [f"任务 {_task_ref(scheduler.tasks, task_id)} 已 finish，不可 resume。"]
+            await scheduler.resume(task_id)
+            foreground_task_id = task_id
+            log_task_id = None
+            return [f"resumed and switched to foreground: {_task_ref(scheduler.tasks, task_id)}"]
         return ["unknown command"]
 
-    def _ack_pending_task_ids_provider() -> list[str]:
-        _refresh_submit_task_state()
-        return list(ack_pending_submit_tasks)
+    def _finish_candidate_task_ids_provider() -> list[str]:
+        _refresh_task_state()
+        return [tid for tid in task_slots if tid not in finished_task_ids]
 
     def _show_candidate_task_ids_provider() -> list[str]:
-        _refresh_submit_task_state()
-        terminal_states = {"completed", "failed", "cancelled"}
-        candidates: list[str] = []
-        for task_id, task in scheduler.tasks.items():
-            status = str(getattr(task, "status", ""))
-            if status not in terminal_states:
-                candidates.append(task_id)
-        for task_id in ack_pending_submit_tasks:
-            if task_id not in candidates:
-                candidates.append(task_id)
-        return candidates
+        _refresh_task_state()
+        return [tid for tid in task_slots if tid not in finished_task_ids]
 
     def _pending_approval_request_refs_provider() -> list[str]:
         return [req.request_ref for req in permission_manager.list_pending()]
@@ -832,9 +881,9 @@ async def _run_tui_mode() -> None:
         scheduler=scheduler,
         pending_approvals_provider=lambda: len(permission_manager.list_pending()),
         command_handler=_handle_cmd,
-        watching_task_id_provider=lambda: watching_task_id,
-        submit_slot_ids_provider=lambda: list(submit_task_slots),
-        ack_pending_task_ids_provider=_ack_pending_task_ids_provider,
+        foreground_task_id_provider=lambda: foreground_task_id,
+        task_slot_ids_provider=lambda: list(task_slots),
+        finish_candidate_task_ids_provider=_finish_candidate_task_ids_provider,
         show_candidate_task_ids_provider=_show_candidate_task_ids_provider,
         approve_candidate_request_refs_provider=_pending_approval_request_refs_provider,
         deny_candidate_request_refs_provider=_pending_approval_request_refs_provider,
