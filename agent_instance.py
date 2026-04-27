@@ -45,6 +45,36 @@ class AgentInstance:
         if self._event_callback is not None:
             self._event_callback(message)
 
+    def _emit_stream_preview(self, tool_name: str, observation: Any) -> None:
+        if tool_name not in {"run_command", "run_python"}:
+            return
+        if not isinstance(observation, dict):
+            return
+
+        stdout_text = str(observation.get("stdout", "")).strip()
+        stderr_text = str(observation.get("stderr", "")).strip()
+        if not stdout_text and not stderr_text:
+            return
+
+        def _preview(text: str) -> str:
+            lines = [ln for ln in text.splitlines() if ln.strip()]
+            if not lines:
+                return ""
+            head = lines[:6]
+            clipped = " | ".join(head)
+            if len(lines) > 6:
+                clipped += f" ...(+{len(lines) - 6} lines)"
+            if len(clipped) > 400:
+                clipped = clipped[:400] + "...<truncated>"
+            return clipped
+
+        out_preview = _preview(stdout_text)
+        err_preview = _preview(stderr_text)
+        if out_preview:
+            self._emit(f"{tool_name} stdout: {out_preview}")
+        if err_preview:
+            self._emit(f"{tool_name} stderr: {err_preview}")
+
     async def run(self, cancel_event: asyncio.Event, pause_event: asyncio.Event | None = None) -> None:
         max_steps = 10
         self._emit("agent started")
@@ -84,13 +114,24 @@ class AgentInstance:
                 observation = await self.tools.call(tool_name, args)
                 await self.memory.append({"tool": tool_name, "args": args, "observation": observation})
                 self.task.local_state["last_observation"] = observation
+                self._emit_stream_preview(tool_name, observation)
                 if isinstance(observation, dict) and observation.get("needs_approval"):
                     request_id = str(observation.get("request_id", ""))
+                    approval_type = str(observation.get("approval_type", "")).strip()
+                    approval_payload = observation.get("approval_payload", {})
+                    approval_detail = ""
+                    if approval_type:
+                        approval_detail = f"type={approval_type} payload={approval_payload}"
+                    elif observation.get("error"):
+                        approval_detail = str(observation.get("error", ""))
                     self.task.status = "paused"
                     self.task.local_state["pending_approval_request_id"] = request_id
                     self.task.local_state["pending_approval_tool_name"] = tool_name
                     self.task.touch()
-                    self._emit(f"waiting for approval request_id={request_id}")
+                    if approval_detail:
+                        self._emit(f"waiting for approval request_id={request_id} detail={approval_detail}")
+                    else:
+                        self._emit(f"waiting for approval request_id={request_id}")
                     return
                 # 使用纯文本 assistant/user 轮次，避免 OpenAI tool role 的 tool_call_id 协议要求。
                 self.context.append({"role": "assistant", "content": str(llm_output)})

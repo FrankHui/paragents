@@ -1,0 +1,11 @@
+from __future__ import annotations
+
+from tui_state import normalize_tui_command
+
+
+def test_normalize_tui_command_aliases() -> None:
+    assert normalize_tui_command(":s hello") == "run hello"
+    assert normalize_tui_command(":sv hi") == "run hi"
+    assert normalize_tui_command(":a") == "approvals"
+    assert normalize_tui_command("/list") == "list"
+    assert normalize_tui_command("写一段总结") == "run 写一段总结"

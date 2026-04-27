@@ -81,6 +81,18 @@ def test_approve_same_request_twice_reports_not_found(tmp_path) -> None:
     assert lines2 == ["approval request not found"]
 
 
+def test_approve_with_short_prefix_request_id(tmp_path) -> None:
+    manager = _build_manager(tmp_path)
+    manager._pending["abc12345-1111-2222-3333-444444444444"] = ApprovalRequest(
+        "abc12345-1111-2222-3333-444444444444",
+        "shell_command",
+        {"command": "python3 --version"},
+    )
+    handled, lines = handle_approval_command("approve abc123", manager)
+    assert handled is True
+    assert any("approved abc123" in line for line in lines)
+
+
 def test_deny_missing_id_returns_error_line(tmp_path) -> None:
     manager = _build_manager(tmp_path)
     handled, lines = handle_approval_command("deny ", manager)

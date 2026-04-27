@@ -19,6 +19,17 @@ class _FakeLLM:
         return {"type": "final", "content": "done"}
 
 
+class _FakeStreamLLM:
+    def __init__(self) -> None:
+        self._calls = 0
+
+    async def infer(self, messages):  # noqa: ANN001
+        self._calls += 1
+        if self._calls == 1:
+            return {"type": "tool", "tool_name": "run_python", "args": {"command": "python3 --version"}}
+        return {"type": "final", "content": "done"}
+
+
 async def _needs_approval_tool(args):  # noqa: ANN001
     return {
         "ok": False,
@@ -48,3 +59,21 @@ def test_scheduler_resume_requeues_approval_paused_task() -> None:
 
     asyncio.run(scheduler.resume("t1"))
     assert scheduler.tasks["t1"].status == "pending"
+
+
+async def _stream_tool(args):  # noqa: ANN001
+    return {"ok": True, "stdout": "line-a\nline-b", "stderr": "warn-1\nwarn-2"}
+
+
+def test_agent_emits_stdout_stderr_preview_for_run_python() -> None:
+    task = Task(task_id="t2", input="run py")
+    events: list[str] = []
+    agent = AgentInstance(
+        task=task,
+        llm_client=_FakeStreamLLM(),  # type: ignore[arg-type]
+        tools=ToolRegistry({"run_python": _stream_tool}),
+        event_callback=events.append,
+    )
+    asyncio.run(agent.run(cancel_event=asyncio.Event()))
+    assert any("run_python stdout:" in e for e in events)
+    assert any("run_python stderr:" in e for e in events)

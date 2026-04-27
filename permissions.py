@@ -5,6 +5,8 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from id_refs import default_short_ref, generate_short_ref
+
 
 @dataclass
 class FsScope:
@@ -19,6 +21,7 @@ class PermissionsConfig:
         default_factory=lambda: {
             "filesystem": True,
             "shell": False,
+            "python": True,
             "git": False,
             "github": False,
             "web": False,
@@ -31,6 +34,13 @@ class PermissionsConfig:
             "blocked": ["rm -rf /", "shutdown", "reboot"],
             "auto_approved": ["pwd", "ls"],
             "needs_approval": ["python", "python3", "git", "npm", "uv"],
+        }
+    )
+    python_policy: dict[str, list[str]] = field(
+        default_factory=lambda: {
+            "blocked": [],
+            "auto_approved": ["python", "python3"],
+            "needs_approval": [],
         }
     )
     git_policy: dict[str, list[str]] = field(
@@ -52,7 +62,12 @@ class ApprovalRequest:
     request_id: str
     request_type: str
     payload: dict[str, str]
+    request_ref: str = ""
     status: str = "pending"
+
+    def __post_init__(self) -> None:
+        if not self.request_ref:
+            self.request_ref = default_short_ref(self.request_id, length=6)
 
 
 @dataclass
@@ -68,11 +83,15 @@ class PermissionManager:
         self._config_path = config_path
         self._pending: dict[str, ApprovalRequest] = {}
         self._pending_shell_by_command: dict[str, str] = {}
+        self._pending_python_by_command: dict[str, str] = {}
         self._pending_git_by_action: dict[str, str] = {}
         self._pending_github_by_action: dict[str, str] = {}
+        self._pending_capability_by_name: dict[str, str] = {}
         self._session_approved_commands: set[str] = set()
+        self._session_approved_python_commands: set[str] = set()
         self._session_approved_git_actions: set[str] = set()
         self._session_approved_github_actions: set[str] = set()
+        self._session_enabled_capabilities: set[str] = set()
 
     @classmethod
     def load_or_create(cls) -> "PermissionManager":
@@ -97,6 +116,7 @@ class PermissionManager:
             capabilities=dict(raw.get("capabilities", {})) or PermissionsConfig().capabilities,
             fs_scopes=scopes,
             shell_policy=dict(raw.get("shell_policy", {})) or PermissionsConfig().shell_policy,
+            python_policy=dict(raw.get("python_policy", {})) or PermissionsConfig().python_policy,
             git_policy=dict(raw.get("git_policy", {})) or PermissionsConfig().git_policy,
             github_policy=dict(raw.get("github_policy", {})) or PermissionsConfig().github_policy,
         )
@@ -107,13 +127,42 @@ class PermissionManager:
             "capabilities": self._config.capabilities,
             "fs_scopes": [asdict(s) for s in self._config.fs_scopes],
             "shell_policy": self._config.shell_policy,
+            "python_policy": self._config.python_policy,
             "git_policy": self._config.git_policy,
             "github_policy": self._config.github_policy,
         }
         self._config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def check_capability(self, capability: str) -> bool:
+        if capability in self._session_enabled_capabilities:
+            return True
         return bool(self._config.capabilities.get(capability, False))
+
+    def check_capability_decision(self, capability: str) -> PermissionDecision:
+        if self.check_capability(capability):
+            return PermissionDecision(allowed=True)
+        existing = self._pending_capability_by_name.get(capability)
+        if existing and self._pending.get(existing) and self._pending[existing].status == "pending":
+            return PermissionDecision(
+                allowed=False,
+                request_id=existing,
+                reason=f"{capability} capability disabled",
+            )
+        request_id = str(uuid.uuid4())
+        existing_refs = {r.request_ref for r in self._pending.values()}
+        request_ref = generate_short_ref(existing_refs, length=6)
+        self._pending[request_id] = ApprovalRequest(
+            request_id=request_id,
+            request_ref=request_ref,
+            request_type="capability_enable",
+            payload={"capability": capability},
+        )
+        self._pending_capability_by_name[capability] = request_id
+        return PermissionDecision(
+            allowed=False,
+            request_id=request_id,
+            reason=f"{capability} capability disabled",
+        )
 
     def check_fs_access(self, raw_path: str, mode: str) -> PermissionDecision:
         target = Path(raw_path).expanduser().resolve()
@@ -131,8 +180,11 @@ class PermissionManager:
                 return PermissionDecision(allowed=True)
 
         request_id = str(uuid.uuid4())
+        existing_refs = {r.request_ref for r in self._pending.values()}
+        request_ref = generate_short_ref(existing_refs, length=6)
         self._pending[request_id] = ApprovalRequest(
             request_id=request_id,
+            request_ref=request_ref,
             request_type="fs_scope",
             payload={"path": str(target), "mode": mode},
         )
@@ -170,8 +222,11 @@ class PermissionManager:
                             reason=f"Command requires approval: {normalized}",
                         )
                 request_id = str(uuid.uuid4())
+                existing_refs = {r.request_ref for r in self._pending.values()}
+                request_ref = generate_short_ref(existing_refs, length=6)
                 self._pending[request_id] = ApprovalRequest(
                     request_id=request_id,
+                    request_ref=request_ref,
                     request_type="shell_command",
                     payload={"command": normalized},
                 )
@@ -184,9 +239,59 @@ class PermissionManager:
 
         return PermissionDecision(allowed=True)
 
+    def check_python_command(self, command: str) -> PermissionDecision:
+        cap_decision = self.check_capability_decision("python")
+        if not cap_decision.allowed:
+            return cap_decision
+
+        normalized = command.strip()
+        lowered = normalized.lower()
+        policy = self._config.python_policy
+
+        for blocked in policy.get("blocked", []):
+            if blocked.lower() in lowered:
+                return PermissionDecision(allowed=False, reason=f"Python command blocked by policy: {blocked}")
+
+        if normalized in self._session_approved_python_commands:
+            return PermissionDecision(allowed=True)
+
+        for auto in policy.get("auto_approved", []):
+            if lowered.startswith(auto.lower()):
+                return PermissionDecision(allowed=True)
+
+        for need in policy.get("needs_approval", []):
+            if lowered.startswith(need.lower()):
+                existing_request_id = self._pending_python_by_command.get(normalized)
+                if existing_request_id:
+                    existing_req = self._pending.get(existing_request_id)
+                    if existing_req is not None and existing_req.status == "pending":
+                        return PermissionDecision(
+                            allowed=False,
+                            request_id=existing_request_id,
+                            reason=f"Python command requires approval: {normalized}",
+                        )
+                request_id = str(uuid.uuid4())
+                existing_refs = {r.request_ref for r in self._pending.values()}
+                request_ref = generate_short_ref(existing_refs, length=6)
+                self._pending[request_id] = ApprovalRequest(
+                    request_id=request_id,
+                    request_ref=request_ref,
+                    request_type="python_command",
+                    payload={"command": normalized},
+                )
+                self._pending_python_by_command[normalized] = request_id
+                return PermissionDecision(
+                    allowed=False,
+                    request_id=request_id,
+                    reason=f"Python command requires approval: {normalized}",
+                )
+
+        return PermissionDecision(allowed=True)
+
     def check_git_action(self, action: str) -> PermissionDecision:
-        if not self.check_capability("git"):
-            return PermissionDecision(allowed=False, reason="git capability disabled")
+        cap_decision = self.check_capability_decision("git")
+        if not cap_decision.allowed:
+            return cap_decision
         normalized = action.strip().lower()
         if normalized in self._session_approved_git_actions:
             return PermissionDecision(allowed=True)
@@ -198,16 +303,19 @@ class PermissionManager:
             if existing and self._pending.get(existing) and self._pending[existing].status == "pending":
                 return PermissionDecision(False, request_id=existing, reason=f"Git action requires approval: {normalized}")
             request_id = str(uuid.uuid4())
+            existing_refs = {r.request_ref for r in self._pending.values()}
+            request_ref = generate_short_ref(existing_refs, length=6)
             self._pending[request_id] = ApprovalRequest(
-                request_id=request_id, request_type="git_action", payload={"action": normalized}
+                request_id=request_id, request_ref=request_ref, request_type="git_action", payload={"action": normalized}
             )
             self._pending_git_by_action[normalized] = request_id
             return PermissionDecision(False, request_id=request_id, reason=f"Git action requires approval: {normalized}")
         return PermissionDecision(allowed=True)
 
     def check_github_request(self, method: str, path: str) -> PermissionDecision:
-        if not self.check_capability("github"):
-            return PermissionDecision(allowed=False, reason="github capability disabled")
+        cap_decision = self.check_capability_decision("github")
+        if not cap_decision.allowed:
+            return cap_decision
         normalized_method = method.strip().upper()
         key = f"{normalized_method}:{path.strip()}"
         if key in self._session_approved_github_actions:
@@ -220,8 +328,10 @@ class PermissionManager:
             if existing and self._pending.get(existing) and self._pending[existing].status == "pending":
                 return PermissionDecision(False, request_id=existing, reason=f"GitHub request needs approval: {key}")
             request_id = str(uuid.uuid4())
+            existing_refs = {r.request_ref for r in self._pending.values()}
+            request_ref = generate_short_ref(existing_refs, length=6)
             self._pending[request_id] = ApprovalRequest(
-                request_id=request_id, request_type="github_action", payload={"action": key}
+                request_id=request_id, request_ref=request_ref, request_type="github_action", payload={"action": key}
             )
             self._pending_github_by_action[key] = request_id
             return PermissionDecision(False, request_id=request_id, reason=f"GitHub request needs approval: {key}")
@@ -229,6 +339,12 @@ class PermissionManager:
 
     def list_pending(self) -> list[ApprovalRequest]:
         return [r for r in self._pending.values() if r.status == "pending"]
+
+    def get_pending(self, request_id: str) -> ApprovalRequest | None:
+        req = self._pending.get(request_id)
+        if req is None or req.status != "pending":
+            return None
+        return req
 
     def approve(self, request_id: str, always: bool = False) -> bool:
         req = self._pending.get(request_id)
@@ -248,6 +364,13 @@ class PermissionManager:
             if always:
                 self._grant_shell_auto_approval(command)
                 self.save()
+        if req.request_type == "python_command":
+            command = req.payload["command"]
+            self._session_approved_python_commands.add(command)
+            self._pending_python_by_command.pop(command, None)
+            if always:
+                self._grant_python_auto_approval(command)
+                self.save()
         if req.request_type == "git_action":
             action = req.payload["action"]
             self._session_approved_git_actions.add(action)
@@ -261,6 +384,13 @@ class PermissionManager:
             self._pending_github_by_action.pop(action, None)
             if always:
                 self.save()
+        if req.request_type == "capability_enable":
+            capability = req.payload["capability"]
+            self._session_enabled_capabilities.add(capability)
+            self._pending_capability_by_name.pop(capability, None)
+            if always:
+                self._config.capabilities[capability] = True
+                self.save()
         return True
 
     def deny(self, request_id: str) -> bool:
@@ -272,6 +402,10 @@ class PermissionManager:
             command = req.payload.get("command")
             if command:
                 self._pending_shell_by_command.pop(command, None)
+        if req.request_type == "python_command":
+            command = req.payload.get("command")
+            if command:
+                self._pending_python_by_command.pop(command, None)
         if req.request_type == "git_action":
             action = req.payload.get("action")
             if action:
@@ -280,6 +414,10 @@ class PermissionManager:
             action = req.payload.get("action")
             if action:
                 self._pending_github_by_action.pop(action, None)
+        if req.request_type == "capability_enable":
+            capability = req.payload.get("capability")
+            if capability:
+                self._pending_capability_by_name.pop(capability, None)
         return True
 
     def _grant_fs_scope(self, path: str, mode: str) -> None:
@@ -299,6 +437,11 @@ class PermissionManager:
 
     def _grant_shell_auto_approval(self, command: str) -> None:
         auto = self._config.shell_policy.setdefault("auto_approved", [])
+        if command not in auto:
+            auto.append(command)
+
+    def _grant_python_auto_approval(self, command: str) -> None:
+        auto = self._config.python_policy.setdefault("auto_approved", [])
         if command not in auto:
             auto.append(command)
 

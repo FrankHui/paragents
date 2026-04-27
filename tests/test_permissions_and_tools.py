@@ -23,6 +23,21 @@ def _build_manager(tmp_path: Path, scopes: list[FsScope]) -> PermissionManager:
     return PermissionManager(cfg, tmp_path / "permissions.json")
 
 
+def _build_disabled_shell_manager(tmp_path: Path, scopes: list[FsScope]) -> PermissionManager:
+    cfg = PermissionsConfig(
+        capabilities={
+            "filesystem": True,
+            "shell": False,
+            "git": False,
+            "github": False,
+            "web": False,
+            "mcp": False,
+        },
+        fs_scopes=scopes,
+    )
+    return PermissionManager(cfg, tmp_path / "permissions.json")
+
+
 def test_read_file_allowed_in_scope(tmp_path: Path) -> None:
     target = tmp_path / "a.txt"
     target.write_text("hello", encoding="utf-8")
@@ -116,6 +131,27 @@ def test_run_command_auto_approved(tmp_path: Path) -> None:
     assert result["exit_code"] == 0
 
 
+def test_run_command_python_route_works_without_shell_capability(tmp_path: Path) -> None:
+    cfg = PermissionsConfig(
+        capabilities={
+            "filesystem": True,
+            "shell": False,
+            "python": True,
+            "git": False,
+            "github": False,
+            "web": False,
+            "mcp": False,
+        },
+        fs_scopes=[FsScope(path=str(tmp_path), read=True, write=True)],
+    )
+    manager = PermissionManager(cfg, tmp_path / "permissions.json")
+    tools = create_default_tools(manager)
+
+    result = asyncio.run(tools["run_command"]({"command": "python3 --version"}))
+    assert result["ok"] is True
+    assert result["mode"] == "python"
+
+
 def test_run_command_approve_always_persists_after_reload(tmp_path: Path) -> None:
     manager = _build_manager(tmp_path, [FsScope(path=str(tmp_path), read=True, write=True)])
     tools = create_default_tools(manager)
@@ -152,3 +188,20 @@ def test_run_command_pending_request_is_deduplicated(tmp_path: Path) -> None:
     assert first["needs_approval"] is True and second["needs_approval"] is True
     assert first["request_id"] == second["request_id"]
     assert len(manager.list_pending()) == 1
+
+
+def test_shell_capability_disabled_requires_approval_then_allows(tmp_path: Path) -> None:
+    manager = _build_disabled_shell_manager(tmp_path, [FsScope(path=str(tmp_path), read=True, write=True)])
+    tools = create_default_tools(manager)
+
+    first = asyncio.run(tools["run_command"]({"command": "python3 --version"}))
+    assert first["ok"] is False
+    assert first["needs_approval"] is True
+    request_id = first["request_id"]
+    assert request_id
+
+    assert manager.approve(request_id, always=False) is True
+    second = asyncio.run(tools["run_command"]({"command": "python3 --version"}))
+    # python 命令会走 run_python 路径，审批通过后直接可执行
+    assert second["ok"] is True
+    assert second.get("mode") == "python"

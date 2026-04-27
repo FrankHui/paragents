@@ -7,6 +7,7 @@ import uuid
 from typing import Any
 
 from agent_instance import AgentInstance
+from id_refs import generate_short_ref
 from llm_client import LLMClient
 from task import Task
 from tools import ToolRegistry
@@ -95,7 +96,9 @@ class Scheduler:
 
     async def submit(self, user_input: str, tools: dict[str, Any]) -> str:
         task_id = str(uuid.uuid4())
-        task = Task(task_id=task_id, input=user_input, status="pending")
+        existing_refs = {t.task_ref for t in self._tasks.values()}
+        task_ref = generate_short_ref(existing_refs, length=6)
+        task = Task(task_id=task_id, input=user_input, task_ref=task_ref, status="pending")
         self._tasks[task_id] = task
         self._task_tools[task_id] = tools
         self._publish_log(task_id, "submitted")

@@ -5,6 +5,7 @@ import ast
 import fnmatch
 import operator
 import re
+import shlex
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,18 @@ SubmitSubagentFunc = Callable[[str, dict[str, ToolFunc]], Awaitable[str]]
 ScheduleFunc = Callable[[float, str, dict[str, ToolFunc]], Awaitable[str]]
 CancelScheduledFunc = Callable[[str], Awaitable[bool]]
 ListScheduledFunc = Callable[[], dict[str, float]]
+
+
+def _approval_meta(permission_manager: PermissionManager, request_id: str | None) -> dict[str, Any]:
+    if not request_id:
+        return {}
+    req = permission_manager.get_pending(request_id)
+    if req is None:
+        return {}
+    return {
+        "approval_type": req.request_type,
+        "approval_payload": dict(req.payload),
+    }
 
 
 class ToolRegistry:
@@ -60,6 +73,7 @@ def create_main_tools(
         "glob": _build_glob_tool(permission_manager),
         "grep": _build_grep_tool(permission_manager),
         "run_command": _build_run_command_tool(permission_manager),
+        "run_python": _build_run_python_tool(permission_manager),
         "spawn": _build_spawn_tool(permission_manager, submit_subagent),
         "git_status": _build_git_tool(permission_manager, "status"),
         "git_diff": _build_git_tool(permission_manager, "diff"),
@@ -85,6 +99,7 @@ def create_subagent_tools(permission_manager: PermissionManager) -> dict[str, To
         "glob": _build_glob_tool(permission_manager),
         "grep": _build_grep_tool(permission_manager),
         "run_command": _build_run_command_tool(permission_manager),
+        "run_python": _build_run_python_tool(permission_manager),
     }
 
 
@@ -127,6 +142,13 @@ def _build_run_command_tool(permission_manager: PermissionManager) -> ToolFunc:
     return _tool
 
 
+def _build_run_python_tool(permission_manager: PermissionManager) -> ToolFunc:
+    async def _tool(args: dict[str, Any]) -> dict[str, Any]:
+        return await run_python_tool(args, permission_manager)
+
+    return _tool
+
+
 def _build_spawn_tool(permission_manager: PermissionManager, submit_subagent: SubmitSubagentFunc | None) -> ToolFunc:
     async def _tool(args: dict[str, Any]) -> dict[str, Any]:
         if submit_subagent is None:
@@ -146,7 +168,13 @@ def _build_git_tool(permission_manager: PermissionManager, action: str) -> ToolF
         decision = permission_manager.check_git_action(action)
         if not decision.allowed:
             if decision.request_id:
-                return {"ok": False, "needs_approval": True, "request_id": decision.request_id, "error": decision.reason}
+                return {
+                    "ok": False,
+                    "needs_approval": True,
+                    "request_id": decision.request_id,
+                    "error": decision.reason,
+                    **_approval_meta(permission_manager, decision.request_id),
+                }
             return {"ok": False, "error": decision.reason or "git action denied"}
         if action == "push":
             remote = str(args.get("remote", "origin"))
@@ -181,7 +209,13 @@ def _build_github_api_tool(permission_manager: PermissionManager) -> ToolFunc:
         decision = permission_manager.check_github_request(method, path)
         if not decision.allowed:
             if decision.request_id:
-                return {"ok": False, "needs_approval": True, "request_id": decision.request_id, "error": decision.reason}
+                return {
+                    "ok": False,
+                    "needs_approval": True,
+                    "request_id": decision.request_id,
+                    "error": decision.reason,
+                    **_approval_meta(permission_manager, decision.request_id),
+                }
             return {"ok": False, "error": decision.reason or "github request denied"}
         # MVP: 先返回模拟成功结果，后续可接真实 GitHub API
         return {"ok": True, "method": method, "path": path, "body": args.get("body")}
@@ -226,8 +260,14 @@ def _build_cancel_scheduled_tool(cancel_scheduled_task: CancelScheduledFunc | No
 
 
 async def read_file_tool(args: dict[str, Any], permission_manager: PermissionManager) -> dict[str, Any]:
-    if not permission_manager.check_capability("filesystem"):
-        return {"ok": False, "error": "filesystem capability disabled"}
+    cap_decision = permission_manager.check_capability_decision("filesystem")
+    if not cap_decision.allowed:
+        return {
+            "ok": False,
+            "error": cap_decision.reason or "filesystem capability disabled",
+            "needs_approval": True,
+            "request_id": cap_decision.request_id,
+        }
 
     raw_path = str(args.get("path", "")).strip()
     if not raw_path:
@@ -245,6 +285,7 @@ async def read_file_tool(args: dict[str, Any], permission_manager: PermissionMan
                 "error": decision.reason,
                 "needs_approval": True,
                 "request_id": decision.request_id,
+                **_approval_meta(permission_manager, decision.request_id),
             }
         if not path.exists():
             return {"ok": False, "error": f"File not found: {path}"}
@@ -267,8 +308,14 @@ async def read_file_tool(args: dict[str, Any], permission_manager: PermissionMan
 
 
 async def list_dir_tool(args: dict[str, Any], permission_manager: PermissionManager) -> dict[str, Any]:
-    if not permission_manager.check_capability("filesystem"):
-        return {"ok": False, "error": "filesystem capability disabled"}
+    cap_decision = permission_manager.check_capability_decision("filesystem")
+    if not cap_decision.allowed:
+        return {
+            "ok": False,
+            "error": cap_decision.reason or "filesystem capability disabled",
+            "needs_approval": True,
+            "request_id": cap_decision.request_id,
+        }
 
     raw_path = str(args.get("path", ".")).strip() or "."
     recursive = bool(args.get("recursive", False))
@@ -279,7 +326,13 @@ async def list_dir_tool(args: dict[str, Any], permission_manager: PermissionMana
         path = Path(raw_path).expanduser().resolve()
         decision = permission_manager.check_fs_access(str(path), "read")
         if not decision.allowed:
-            return {"ok": False, "error": decision.reason, "needs_approval": True, "request_id": decision.request_id}
+            return {
+                "ok": False,
+                "error": decision.reason,
+                "needs_approval": True,
+                "request_id": decision.request_id,
+                **_approval_meta(permission_manager, decision.request_id),
+            }
         if not path.exists():
             return {"ok": False, "error": f"Path not found: {path}"}
         if not path.is_dir():
@@ -299,8 +352,14 @@ async def list_dir_tool(args: dict[str, Any], permission_manager: PermissionMana
 
 
 async def glob_tool(args: dict[str, Any], permission_manager: PermissionManager) -> dict[str, Any]:
-    if not permission_manager.check_capability("filesystem"):
-        return {"ok": False, "error": "filesystem capability disabled"}
+    cap_decision = permission_manager.check_capability_decision("filesystem")
+    if not cap_decision.allowed:
+        return {
+            "ok": False,
+            "error": cap_decision.reason or "filesystem capability disabled",
+            "needs_approval": True,
+            "request_id": cap_decision.request_id,
+        }
 
     pattern = str(args.get("pattern", "")).strip()
     if not pattern:
@@ -313,7 +372,13 @@ async def glob_tool(args: dict[str, Any], permission_manager: PermissionManager)
         base_dir = Path(base_dir_raw).expanduser().resolve()
         decision = permission_manager.check_fs_access(str(base_dir), "read")
         if not decision.allowed:
-            return {"ok": False, "error": decision.reason, "needs_approval": True, "request_id": decision.request_id}
+            return {
+                "ok": False,
+                "error": decision.reason,
+                "needs_approval": True,
+                "request_id": decision.request_id,
+                **_approval_meta(permission_manager, decision.request_id),
+            }
         if not base_dir.exists() or not base_dir.is_dir():
             return {"ok": False, "error": f"Invalid base_dir: {base_dir}"}
 
@@ -330,8 +395,14 @@ async def glob_tool(args: dict[str, Any], permission_manager: PermissionManager)
 
 
 async def grep_tool(args: dict[str, Any], permission_manager: PermissionManager) -> dict[str, Any]:
-    if not permission_manager.check_capability("filesystem"):
-        return {"ok": False, "error": "filesystem capability disabled"}
+    cap_decision = permission_manager.check_capability_decision("filesystem")
+    if not cap_decision.allowed:
+        return {
+            "ok": False,
+            "error": cap_decision.reason or "filesystem capability disabled",
+            "needs_approval": True,
+            "request_id": cap_decision.request_id,
+        }
 
     pattern = str(args.get("pattern", "")).strip()
     if not pattern:
@@ -345,7 +416,13 @@ async def grep_tool(args: dict[str, Any], permission_manager: PermissionManager)
         root = Path(path_raw).expanduser().resolve()
         decision = permission_manager.check_fs_access(str(root), "read")
         if not decision.allowed:
-            return {"ok": False, "error": decision.reason, "needs_approval": True, "request_id": decision.request_id}
+            return {
+                "ok": False,
+                "error": decision.reason,
+                "needs_approval": True,
+                "request_id": decision.request_id,
+                **_approval_meta(permission_manager, decision.request_id),
+            }
 
         regex = re.compile(pattern)
         files = [root] if root.is_file() else [p for p in root.rglob("*") if p.is_file()]
@@ -370,12 +447,27 @@ async def grep_tool(args: dict[str, Any], permission_manager: PermissionManager)
 
 
 async def run_command_tool(args: dict[str, Any], permission_manager: PermissionManager) -> dict[str, Any]:
-    if not permission_manager.check_capability("shell"):
-        return {"ok": False, "error": "shell capability disabled"}
-
     command = str(args.get("command", "")).strip()
     if not command:
         return {"ok": False, "error": "Missing command"}
+
+    # 对 python/python3 命令走独立工具，避免额外 shell 权限步骤。
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = []
+    if tokens and tokens[0] in {"python", "python3"}:
+        return await run_python_tool({"command": command, "timeout_s": args.get("timeout_s", 10)}, permission_manager)
+
+    cap_decision = permission_manager.check_capability_decision("shell")
+    if not cap_decision.allowed:
+        return {
+            "ok": False,
+            "error": cap_decision.reason or "shell capability disabled",
+            "needs_approval": True,
+            "request_id": cap_decision.request_id,
+            **_approval_meta(permission_manager, cap_decision.request_id),
+        }
 
     decision = permission_manager.check_shell_command(command)
     if not decision.allowed:
@@ -385,6 +477,7 @@ async def run_command_tool(args: dict[str, Any], permission_manager: PermissionM
                 "error": decision.reason or "Command needs approval",
                 "needs_approval": True,
                 "request_id": decision.request_id,
+                **_approval_meta(permission_manager, decision.request_id),
             }
         return {"ok": False, "error": decision.reason or "Command blocked"}
 
@@ -410,6 +503,70 @@ async def run_command_tool(args: dict[str, Any], permission_manager: PermissionM
             "exit_code": int(proc.returncode or 0),
             "stdout": out[:8000],
             "stderr": err[:8000],
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+async def run_python_tool(args: dict[str, Any], permission_manager: PermissionManager) -> dict[str, Any]:
+    command = str(args.get("command", "")).strip()
+    if not command:
+        script = str(args.get("script", "")).strip()
+        if not script:
+            return {"ok": False, "error": "Missing python command or script"}
+        py = str(args.get("python_bin", "python3")).strip() or "python3"
+        extra_args = args.get("args", [])
+        if isinstance(extra_args, list):
+            safe_args = [str(x) for x in extra_args]
+        else:
+            safe_args = []
+        command = " ".join([py, script, *safe_args]).strip()
+
+    decision = permission_manager.check_python_command(command)
+    if not decision.allowed:
+        if decision.request_id:
+            return {
+                "ok": False,
+                "error": decision.reason or "Python command needs approval",
+                "needs_approval": True,
+                "request_id": decision.request_id,
+                **_approval_meta(permission_manager, decision.request_id),
+            }
+        return {"ok": False, "error": decision.reason or "Python command blocked"}
+
+    timeout_s = float(args.get("timeout_s", 10) or 10)
+    timeout_s = max(1, min(timeout_s, 120))
+
+    try:
+        tokens = shlex.split(command)
+    except ValueError as exc:
+        return {"ok": False, "error": f"Invalid python command: {exc}"}
+    if not tokens:
+        return {"ok": False, "error": "Invalid python command"}
+    if tokens[0] not in {"python", "python3"}:
+        return {"ok": False, "error": "run_python only supports python/python3 entrypoint"}
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *tokens,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return {"ok": False, "error": f"Python command timeout after {timeout_s}s"}
+
+        out = stdout.decode("utf-8", errors="replace")
+        err = stderr.decode("utf-8", errors="replace")
+        return {
+            "ok": proc.returncode == 0,
+            "exit_code": int(proc.returncode or 0),
+            "stdout": out[:8000],
+            "stderr": err[:8000],
+            "mode": "python",
         }
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
