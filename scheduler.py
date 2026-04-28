@@ -5,6 +5,7 @@ import contextlib
 import os
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 from agent_instance import AgentInstance
@@ -31,6 +32,7 @@ class Scheduler:
         self._dispatch_task: asyncio.Task[None] | None = None
         self._scheduled_handles: dict[str, asyncio.Task[None]] = {}
         self._scheduled_meta: dict[str, float] = {}
+        self._runs_root = Path.cwd() / ".paragents" / "runs"
         self._debug_enabled = os.getenv("PARAGENTS_TUI_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
 
     @property
@@ -96,11 +98,33 @@ class Scheduler:
         if self._dispatch_task is None or self._dispatch_task.done():
             self._dispatch_task = asyncio.create_task(self._dispatch_loop())
 
-    async def submit(self, user_input: str, tools: dict[str, Any]) -> str:
+    async def submit(
+        self,
+        user_input: str,
+        tools: dict[str, Any],
+        parent_task_id: str | None = None,
+        lineage_root_id: str | None = None,
+    ) -> str:
         task_id = str(uuid.uuid4())
         existing_refs = {t.task_ref for t in self._tasks.values()}
         task_ref = generate_short_ref(existing_refs, length=6)
-        task = Task(task_id=task_id, input=user_input, task_ref=task_ref, status="pending")
+        run_dir = self._runs_root / task_ref
+        run_dir.mkdir(parents=True, exist_ok=True)
+        task = Task(
+            task_id=task_id,
+            input=user_input,
+            task_ref=task_ref,
+            parent_task_id=parent_task_id,
+            lineage_root_id=lineage_root_id or parent_task_id or task_id,
+            run_dir=str(run_dir),
+            status="pending",
+        )
+        task.local_state = {
+            **task.local_state,
+            "run_dir": task.run_dir,
+            "parent_task_id": task.parent_task_id,
+            "lineage_root_id": task.lineage_root_id,
+        }
         task.local_state.setdefault("initial_input", user_input)
         self._tasks[task_id] = task
         self._task_tools[task_id] = tools
@@ -206,7 +230,28 @@ class Scheduler:
             self._cancel_events[task_id] = cancel_event
             self._pause_events[task_id] = pause_event
 
-            tools = ToolRegistry(self._task_tools.get(task_id, {}))
+            raw_tools = self._task_tools.get(task_id, {})
+            run_dir = task.run_dir
+            lineage_root_id = task.lineage_root_id
+            bound_tools: dict[str, Any] = {}
+            for name, tool in raw_tools.items():
+                async def _bound(
+                    args: dict[str, Any],
+                    tool=tool,
+                    _task_id=task_id,
+                    _run_dir=run_dir,
+                    _lineage_root_id=lineage_root_id,
+                ) -> dict[str, Any]:
+                    merged = dict(args)
+                    merged.setdefault("_task_id", _task_id)
+                    if _run_dir:
+                        merged.setdefault("_task_run_dir", _run_dir)
+                    if _lineage_root_id:
+                        merged.setdefault("_lineage_root_id", _lineage_root_id)
+                    return await tool(merged)
+
+                bound_tools[name] = _bound
+            tools = ToolRegistry(bound_tools)
             if self._llm_client is None:
                 task.status = "failed"
                 task.error = "llm client is unavailable"

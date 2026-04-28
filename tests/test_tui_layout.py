@@ -74,6 +74,30 @@ def test_watch_logs_are_appended_into_unified_stream() -> None:
     assert "line2" in panel_text
 
 
+def test_watch_key_events_append_lines_instead_of_only_spinner_updates() -> None:
+    async def _handler(_: str) -> list[str]:
+        return []
+
+    scheduler = _FakeScheduler()
+    scheduler.tasks = {"t1": Task(task_id="t1", input="x", status="running", task_ref="t10000")}
+    scheduler.logs_by_task["t1"] = [
+        "[12:00:00] llm infer round=1",
+        "[12:00:01] tool call name=run_command",
+        "[12:00:02] tool observation received",
+    ]
+    tui = ParagentsTUI(
+        scheduler=scheduler,  # type: ignore[arg-type]
+        pending_approvals_provider=lambda: 0,
+        command_handler=_handler,
+    )
+    tui.show_welcome = False
+    tui.watching_task_id = "t1"
+    tui.watch_source = "show"
+
+    _ = tui._log_panel_text()
+    assert tui._watch_phase_by_task.get("t1") == "processing..."
+
+
 def test_run_command_sets_watch_task_id() -> None:
     async def _handler(_: str) -> list[str]:
         return []
@@ -638,6 +662,68 @@ def test_run_command_always_appends_output_lines() -> None:
     tui.show_welcome = False
     asyncio.run(tui._run_command("run hello"))
     assert any("submitted:" in line for line in tui.logs)
+
+
+def test_run_command_exception_is_rendered_in_logs() -> None:
+    async def _handler(_: str) -> list[str]:
+        raise RuntimeError("boom in handler")
+
+    tui = ParagentsTUI(
+        scheduler=_FakeScheduler(),  # type: ignore[arg-type]
+        pending_approvals_provider=lambda: 0,
+        command_handler=_handler,
+    )
+    tui.show_welcome = False
+
+    asyncio.run(tui._run_command("approve deadbe"))
+    assert any("[TUI ERROR]" in line for line in tui.logs)
+    assert any("boom in handler" in line for line in tui.logs)
+
+
+def test_run_command_resets_main_log_back_offset_to_follow_latest() -> None:
+    async def _handler(_: str) -> list[str]:
+        return ["ok"]
+
+    tui = ParagentsTUI(
+        scheduler=_FakeScheduler(),  # type: ignore[arg-type]
+        pending_approvals_provider=lambda: 0,
+        command_handler=_handler,
+    )
+    tui.show_welcome = False
+    tui._side_log_back_offset = 20
+
+    asyncio.run(tui._run_command("list"))
+
+    assert tui._side_log_back_offset == 0
+    assert any("ok" in line for line in tui.logs)
+
+
+def test_command_output_is_temporarily_pinned_when_watch_logs_are_busy() -> None:
+    async def _handler(_: str) -> list[str]:
+        return ["list result line"]
+
+    scheduler = _FakeScheduler()
+    task = Task(task_id="abcd11112222", input="x", status="running", task_ref="ab12cd")
+    scheduler.tasks = {task.task_id: task}
+    scheduler.logs_by_task[task.task_id] = [f"[12:00:{i:02d}] watch line {i}" for i in range(80)]
+    tui = ParagentsTUI(
+        scheduler=scheduler,  # type: ignore[arg-type]
+        pending_approvals_provider=lambda: 0,
+        command_handler=_handler,
+    )
+    tui.show_welcome = False
+    tui.watching_task_id = task.task_id
+    tui.watch_source = "show"
+
+    # 首次渲染先吃掉已有 watch 日志。
+    _ = tui._log_panel_text()
+    # 新增一批日志，模拟持续刷屏。
+    scheduler.logs_by_task[task.task_id].extend([f"[12:01:{i:02d}] watch tail {i}" for i in range(60)])
+
+    asyncio.run(tui._run_command("list"))
+    text = tui._log_panel_text()
+    assert "list result" in text
+    assert "line" in text
 
 
 def test_log_panel_uses_dynamic_line_limit_instead_of_fixed_30() -> None:

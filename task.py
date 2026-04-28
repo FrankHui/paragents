@@ -21,6 +21,9 @@ class Task:
     task_id: str
     input: str
     task_ref: str = ""
+    parent_task_id: str | None = None
+    lineage_root_id: str | None = None
+    run_dir: str = ""
     status: TaskStatus = "pending"
     result: Optional[Any] = None
     error: Optional[str] = None
@@ -36,3 +39,5 @@ class Task:
     def __post_init__(self) -> None:
         if not self.task_ref:
             self.task_ref = default_short_ref(self.task_id, length=6)
+        if self.lineage_root_id is None:
+            self.lineage_root_id = self.parent_task_id or self.task_id

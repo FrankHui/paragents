@@ -173,8 +173,18 @@ async def _run_cli() -> None:
     pending_run_request_id: str | None = None
     _setup_readline()
 
-    async def _submit_subagent(input_text: str, tools: dict[str, Any]) -> str:
-        return await scheduler.submit(input_text, tools=tools)
+    async def _submit_subagent(
+        input_text: str,
+        tools: dict[str, Any],
+        parent_task_id: str | None = None,
+        lineage_root_id: str | None = None,
+    ) -> str:
+        return await scheduler.submit(
+            input_text,
+            tools=tools,
+            parent_task_id=parent_task_id,
+            lineage_root_id=lineage_root_id,
+        )
 
     def _build_main_tools() -> dict[str, Any]:
         return create_main_tools(
@@ -636,8 +646,18 @@ async def _run_tui_mode() -> None:
     task_slots: list[str] = []
     finished_task_ids: set[str] = set()
 
-    async def _submit_subagent(input_text: str, tools: dict[str, Any]) -> str:
-        return await scheduler.submit(input_text, tools=tools)
+    async def _submit_subagent(
+        input_text: str,
+        tools: dict[str, Any],
+        parent_task_id: str | None = None,
+        lineage_root_id: str | None = None,
+    ) -> str:
+        return await scheduler.submit(
+            input_text,
+            tools=tools,
+            parent_task_id=parent_task_id,
+            lineage_root_id=lineage_root_id,
+        )
 
     def _build_main_tools() -> dict[str, Any]:
         return create_main_tools(
@@ -691,6 +711,10 @@ async def _run_tui_mode() -> None:
         nonlocal foreground_task_id, log_task_id, pending_run_request_id
         out: list[str] = []
         _refresh_task_state()
+        slash_mode = False
+        if cmd.startswith("__slash__ "):
+            slash_mode = True
+            cmd = cmd[len("__slash__ ") :].strip()
         pending_ids_before = [(req.request_id, req.request_ref) for req in permission_manager.list_pending()]
         pending_run_request_id = _get_active_approval_request_id(scheduler, foreground_task_id, foreground_task_id)
         if cmd in {"y", "n"} and pending_run_request_id:
@@ -723,7 +747,7 @@ async def _run_tui_mode() -> None:
             "y",
             "n",
         )
-        if not cmd.startswith(known_prefixes):
+        if not slash_mode and not cmd.startswith(known_prefixes):
             cmd = f"{'run' if foreground_task_id else 'new'} {cmd}"
         if cmd.startswith("finish "):
             _refresh_task_state()
@@ -835,8 +859,7 @@ async def _run_tui_mode() -> None:
                 return [f"任务 {_task_ref(scheduler.tasks, task_id)} 已 finish 并释放，不支持 /show。"]
             foreground_task_id = task_id
             log_task_id = None
-            logs = scheduler.get_task_logs(task_id, limit=30)
-            return [f"switched to foreground: {_task_ref(scheduler.tasks, task_id)}", *logs]
+            return [f"switched to foreground: {_task_ref(scheduler.tasks, task_id)}"]
         if cmd.startswith("log "):
             raw_task_id = cmd.split(" ", 1)[1].strip()
             task_id, err = _resolve_task_id(raw_task_id, scheduler.tasks)
@@ -844,8 +867,7 @@ async def _run_tui_mode() -> None:
                 return [err or "task not found"]
             foreground_task_id = None
             log_task_id = task_id
-            logs = scheduler.get_task_logs(task_id, limit=30)
-            return [f"readonly log view: {_task_ref(scheduler.tasks, task_id)}", *logs]
+            return [f"readonly log view: {_task_ref(scheduler.tasks, task_id)}"]
         if cmd.startswith("cancel "):
             await scheduler.cancel(cmd.split(" ", 1)[1].strip())
             return ["cancel signal sent"]

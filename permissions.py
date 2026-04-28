@@ -63,6 +63,7 @@ class ApprovalRequest:
     request_type: str
     payload: dict[str, str]
     request_ref: str = ""
+    owner_task_id: str | None = None
     status: str = "pending"
 
     def __post_init__(self) -> None:
@@ -82,16 +83,19 @@ class PermissionManager:
         self._config = config
         self._config_path = config_path
         self._pending: dict[str, ApprovalRequest] = {}
-        self._pending_shell_by_command: dict[str, str] = {}
-        self._pending_python_by_command: dict[str, str] = {}
-        self._pending_git_by_action: dict[str, str] = {}
-        self._pending_github_by_action: dict[str, str] = {}
-        self._pending_capability_by_name: dict[str, str] = {}
-        self._session_approved_commands: set[str] = set()
-        self._session_approved_python_commands: set[str] = set()
-        self._session_approved_git_actions: set[str] = set()
-        self._session_approved_github_actions: set[str] = set()
-        self._session_enabled_capabilities: set[str] = set()
+        self._pending_shell_by_command: dict[tuple[str, str], str] = {}
+        self._pending_python_by_command: dict[tuple[str, str], str] = {}
+        self._pending_git_by_action: dict[tuple[str, str], str] = {}
+        self._pending_github_by_action: dict[tuple[str, str], str] = {}
+        self._pending_capability_by_name: dict[tuple[str, str], str] = {}
+        self._session_approved_commands: dict[str, set[str]] = {}
+        self._session_approved_python_commands: dict[str, set[str]] = {}
+        self._session_approved_git_actions: dict[str, set[str]] = {}
+        self._session_approved_github_actions: dict[str, set[str]] = {}
+        self._session_enabled_capabilities: dict[str, set[str]] = {}
+
+    def _scope(self, task_id: str | None) -> str:
+        return task_id or "__global__"
 
     @classmethod
     def load_or_create(cls) -> "PermissionManager":
@@ -133,20 +137,22 @@ class PermissionManager:
         }
         self._config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def check_capability(self, capability: str) -> bool:
-        if capability in self._session_enabled_capabilities:
+    def check_capability(self, capability: str, task_id: str | None = None) -> bool:
+        scope = self._scope(task_id)
+        if capability in self._session_enabled_capabilities.get(scope, set()):
             return True
         return bool(self._config.capabilities.get(capability, False))
 
-    def check_capability_decision(self, capability: str) -> PermissionDecision:
-        if self.check_capability(capability):
+    def check_capability_decision(self, capability: str, task_id: str | None = None) -> PermissionDecision:
+        scope = self._scope(task_id)
+        if self.check_capability(capability, task_id=task_id):
             return PermissionDecision(allowed=True)
-        existing = self._pending_capability_by_name.get(capability)
+        existing = self._pending_capability_by_name.get((scope, capability))
         if existing and self._pending.get(existing) and self._pending[existing].status == "pending":
             return PermissionDecision(
                 allowed=False,
                 request_id=existing,
-                reason=f"{capability} capability disabled",
+                reason=f"{capability} capability waiting for approval",
             )
         request_id = str(uuid.uuid4())
         existing_refs = {r.request_ref for r in self._pending.values()}
@@ -156,12 +162,13 @@ class PermissionManager:
             request_ref=request_ref,
             request_type="capability_enable",
             payload={"capability": capability},
+            owner_task_id=task_id,
         )
-        self._pending_capability_by_name[capability] = request_id
+        self._pending_capability_by_name[(scope, capability)] = request_id
         return PermissionDecision(
             allowed=False,
             request_id=request_id,
-            reason=f"{capability} capability disabled",
+            reason=f"{capability} capability waiting for approval",
         )
 
     def check_fs_access(self, raw_path: str, mode: str) -> PermissionDecision:
@@ -194,7 +201,8 @@ class PermissionManager:
             reason=f"Path not in allowed scope for {mode}",
         )
 
-    def check_shell_command(self, command: str) -> PermissionDecision:
+    def check_shell_command(self, command: str, task_id: str | None = None) -> PermissionDecision:
+        scope = self._scope(task_id)
         normalized = command.strip()
         lowered = normalized.lower()
         policy = self._config.shell_policy
@@ -203,7 +211,7 @@ class PermissionManager:
             if blocked.lower() in lowered:
                 return PermissionDecision(allowed=False, reason=f"Command blocked by policy: {blocked}")
 
-        if normalized in self._session_approved_commands:
+        if normalized in self._session_approved_commands.get(scope, set()):
             return PermissionDecision(allowed=True)
 
         for auto in policy.get("auto_approved", []):
@@ -212,7 +220,7 @@ class PermissionManager:
 
         for need in policy.get("needs_approval", []):
             if lowered.startswith(need.lower()):
-                existing_request_id = self._pending_shell_by_command.get(normalized)
+                existing_request_id = self._pending_shell_by_command.get((scope, normalized))
                 if existing_request_id:
                     existing_req = self._pending.get(existing_request_id)
                     if existing_req is not None and existing_req.status == "pending":
@@ -229,8 +237,9 @@ class PermissionManager:
                     request_ref=request_ref,
                     request_type="shell_command",
                     payload={"command": normalized},
+                    owner_task_id=task_id,
                 )
-                self._pending_shell_by_command[normalized] = request_id
+                self._pending_shell_by_command[(scope, normalized)] = request_id
                 return PermissionDecision(
                     allowed=False,
                     request_id=request_id,
@@ -239,8 +248,9 @@ class PermissionManager:
 
         return PermissionDecision(allowed=True)
 
-    def check_python_command(self, command: str) -> PermissionDecision:
-        cap_decision = self.check_capability_decision("python")
+    def check_python_command(self, command: str, task_id: str | None = None) -> PermissionDecision:
+        scope = self._scope(task_id)
+        cap_decision = self.check_capability_decision("python", task_id=task_id)
         if not cap_decision.allowed:
             return cap_decision
 
@@ -252,7 +262,7 @@ class PermissionManager:
             if blocked.lower() in lowered:
                 return PermissionDecision(allowed=False, reason=f"Python command blocked by policy: {blocked}")
 
-        if normalized in self._session_approved_python_commands:
+        if normalized in self._session_approved_python_commands.get(scope, set()):
             return PermissionDecision(allowed=True)
 
         for auto in policy.get("auto_approved", []):
@@ -261,7 +271,7 @@ class PermissionManager:
 
         for need in policy.get("needs_approval", []):
             if lowered.startswith(need.lower()):
-                existing_request_id = self._pending_python_by_command.get(normalized)
+                existing_request_id = self._pending_python_by_command.get((scope, normalized))
                 if existing_request_id:
                     existing_req = self._pending.get(existing_request_id)
                     if existing_req is not None and existing_req.status == "pending":
@@ -278,8 +288,9 @@ class PermissionManager:
                     request_ref=request_ref,
                     request_type="python_command",
                     payload={"command": normalized},
+                    owner_task_id=task_id,
                 )
-                self._pending_python_by_command[normalized] = request_id
+                self._pending_python_by_command[(scope, normalized)] = request_id
                 return PermissionDecision(
                     allowed=False,
                     request_id=request_id,
@@ -288,68 +299,85 @@ class PermissionManager:
 
         return PermissionDecision(allowed=True)
 
-    def check_git_action(self, action: str) -> PermissionDecision:
-        cap_decision = self.check_capability_decision("git")
+    def check_git_action(self, action: str, task_id: str | None = None) -> PermissionDecision:
+        scope = self._scope(task_id)
+        cap_decision = self.check_capability_decision("git", task_id=task_id)
         if not cap_decision.allowed:
             return cap_decision
         normalized = action.strip().lower()
-        if normalized in self._session_approved_git_actions:
+        if normalized in self._session_approved_git_actions.get(scope, set()):
             return PermissionDecision(allowed=True)
         policy = self._config.git_policy
         if normalized in [a.lower() for a in policy.get("auto_approved", [])]:
             return PermissionDecision(allowed=True)
         if normalized in [a.lower() for a in policy.get("needs_approval", [])]:
-            existing = self._pending_git_by_action.get(normalized)
+            existing = self._pending_git_by_action.get((scope, normalized))
             if existing and self._pending.get(existing) and self._pending[existing].status == "pending":
                 return PermissionDecision(False, request_id=existing, reason=f"Git action requires approval: {normalized}")
             request_id = str(uuid.uuid4())
             existing_refs = {r.request_ref for r in self._pending.values()}
             request_ref = generate_short_ref(existing_refs, length=6)
             self._pending[request_id] = ApprovalRequest(
-                request_id=request_id, request_ref=request_ref, request_type="git_action", payload={"action": normalized}
+                request_id=request_id,
+                request_ref=request_ref,
+                request_type="git_action",
+                payload={"action": normalized},
+                owner_task_id=task_id,
             )
-            self._pending_git_by_action[normalized] = request_id
+            self._pending_git_by_action[(scope, normalized)] = request_id
             return PermissionDecision(False, request_id=request_id, reason=f"Git action requires approval: {normalized}")
         return PermissionDecision(allowed=True)
 
-    def check_github_request(self, method: str, path: str) -> PermissionDecision:
-        cap_decision = self.check_capability_decision("github")
+    def check_github_request(self, method: str, path: str, task_id: str | None = None) -> PermissionDecision:
+        scope = self._scope(task_id)
+        cap_decision = self.check_capability_decision("github", task_id=task_id)
         if not cap_decision.allowed:
             return cap_decision
         normalized_method = method.strip().upper()
         key = f"{normalized_method}:{path.strip()}"
-        if key in self._session_approved_github_actions:
+        if key in self._session_approved_github_actions.get(scope, set()):
             return PermissionDecision(allowed=True)
         policy = self._config.github_policy
         if normalized_method in [m.upper() for m in policy.get("auto_approved_methods", [])]:
             return PermissionDecision(allowed=True)
         if normalized_method in [m.upper() for m in policy.get("needs_approval_methods", [])]:
-            existing = self._pending_github_by_action.get(key)
+            existing = self._pending_github_by_action.get((scope, key))
             if existing and self._pending.get(existing) and self._pending[existing].status == "pending":
                 return PermissionDecision(False, request_id=existing, reason=f"GitHub request needs approval: {key}")
             request_id = str(uuid.uuid4())
             existing_refs = {r.request_ref for r in self._pending.values()}
             request_ref = generate_short_ref(existing_refs, length=6)
             self._pending[request_id] = ApprovalRequest(
-                request_id=request_id, request_ref=request_ref, request_type="github_action", payload={"action": key}
+                request_id=request_id,
+                request_ref=request_ref,
+                request_type="github_action",
+                payload={"action": key},
+                owner_task_id=task_id,
             )
-            self._pending_github_by_action[key] = request_id
+            self._pending_github_by_action[(scope, key)] = request_id
             return PermissionDecision(False, request_id=request_id, reason=f"GitHub request needs approval: {key}")
         return PermissionDecision(allowed=True)
 
-    def list_pending(self) -> list[ApprovalRequest]:
-        return [r for r in self._pending.values() if r.status == "pending"]
+    def list_pending(self, task_id: str | None = None) -> list[ApprovalRequest]:
+        if task_id is None:
+            return [r for r in self._pending.values() if r.status == "pending"]
+        return [r for r in self._pending.values() if r.status == "pending" and r.owner_task_id == task_id]
 
-    def get_pending(self, request_id: str) -> ApprovalRequest | None:
+    def get_pending(self, request_id: str, task_id: str | None = None) -> ApprovalRequest | None:
         req = self._pending.get(request_id)
         if req is None or req.status != "pending":
             return None
+        if task_id is not None and req.owner_task_id != task_id:
+            return None
         return req
 
-    def approve(self, request_id: str, always: bool = False) -> bool:
+    def approve(self, request_id: str, always: bool = False, task_id: str | None = None) -> bool:
         req = self._pending.get(request_id)
         if req is None or req.status != "pending":
             return False
+        if task_id is not None and req.owner_task_id != task_id:
+            return False
+        scope = self._scope(req.owner_task_id)
         req.status = "approved"
         if req.request_type == "fs_scope":
             path = req.payload["path"]
@@ -359,65 +387,68 @@ class PermissionManager:
                 self.save()
         if req.request_type == "shell_command":
             command = req.payload["command"]
-            self._session_approved_commands.add(command)
-            self._pending_shell_by_command.pop(command, None)
+            self._session_approved_commands.setdefault(scope, set()).add(command)
+            self._pending_shell_by_command.pop((scope, command), None)
             if always:
                 self._grant_shell_auto_approval(command)
                 self.save()
         if req.request_type == "python_command":
             command = req.payload["command"]
-            self._session_approved_python_commands.add(command)
-            self._pending_python_by_command.pop(command, None)
+            self._session_approved_python_commands.setdefault(scope, set()).add(command)
+            self._pending_python_by_command.pop((scope, command), None)
             if always:
                 self._grant_python_auto_approval(command)
                 self.save()
         if req.request_type == "git_action":
             action = req.payload["action"]
-            self._session_approved_git_actions.add(action)
-            self._pending_git_by_action.pop(action, None)
+            self._session_approved_git_actions.setdefault(scope, set()).add(action)
+            self._pending_git_by_action.pop((scope, action), None)
             if always:
                 self._grant_git_auto_approval(action)
                 self.save()
         if req.request_type == "github_action":
             action = req.payload["action"]
-            self._session_approved_github_actions.add(action)
-            self._pending_github_by_action.pop(action, None)
+            self._session_approved_github_actions.setdefault(scope, set()).add(action)
+            self._pending_github_by_action.pop((scope, action), None)
             if always:
                 self.save()
         if req.request_type == "capability_enable":
             capability = req.payload["capability"]
-            self._session_enabled_capabilities.add(capability)
-            self._pending_capability_by_name.pop(capability, None)
+            self._session_enabled_capabilities.setdefault(scope, set()).add(capability)
+            self._pending_capability_by_name.pop((scope, capability), None)
             if always:
                 self._config.capabilities[capability] = True
                 self.save()
         return True
 
-    def deny(self, request_id: str) -> bool:
+    def deny(self, request_id: str, task_id: str | None = None) -> bool:
         req = self._pending.get(request_id)
         if req is None or req.status != "pending":
             return False
+        if task_id is not None and req.owner_task_id != task_id:
+            return False
+        scope = self._scope(req.owner_task_id)
         req.status = "denied"
         if req.request_type == "shell_command":
             command = req.payload.get("command")
             if command:
-                self._pending_shell_by_command.pop(command, None)
+                self._pending_shell_by_command.pop((scope, command), None)
         if req.request_type == "python_command":
             command = req.payload.get("command")
             if command:
-                self._pending_python_by_command.pop(command, None)
+                self._pending_python_by_command.pop((scope, command), None)
         if req.request_type == "git_action":
             action = req.payload.get("action")
             if action:
-                self._pending_git_by_action.pop(action, None)
+                self._pending_git_by_action.pop((scope, action), None)
         if req.request_type == "github_action":
             action = req.payload.get("action")
             if action:
-                self._pending_github_by_action.pop(action, None)
+                self._pending_github_by_action.pop((scope, action), None)
         if req.request_type == "capability_enable":
             capability = req.payload.get("capability")
             if capability:
-                self._pending_capability_by_name.pop(capability, None)
+                self._pending_capability_by_name.pop((scope, capability), None)
         return True
 
     def _grant_fs_scope(self, path: str, mode: str) -> None:

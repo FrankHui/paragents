@@ -7,6 +7,7 @@ import hashlib
 import platform
 import re
 import time
+import traceback
 from typing import Any, Awaitable, Callable
 
 from prompt_toolkit.application import Application
@@ -265,12 +266,15 @@ class ParagentsTUI:
         self._spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
         self._spinner_idx = 0
         self._side_log_max_width = 88
+        self._pinned_command_lines: list[str] = []
+        self._pinned_command_ttl = 0
         self._blink_on = True
         self._task_slot_ids: list[str] = []
         self._submit_slot_ids: list[str] = self._task_slot_ids
         self._bound_main_task_id: str | None = None
         self._watch_pump_task: asyncio.Task[None] | None = None
         self._max_main_log_lines = 4000
+        self._system_notices: list[tuple[str, int]] = []
         self.parts = build_tui_layout(
             show_options_filter=Condition(lambda: self.show_options or self.context_popup_mode is not None),
             submit_count_provider=lambda: len(self._submit_task_views()),
@@ -317,6 +321,21 @@ class ParagentsTUI:
     def _extend_main_logs(self, lines: list[str]) -> None:
         for line in lines:
             self._append_main_log(line)
+
+    def _push_system_notice(self, line: str, ttl: int = 2) -> None:
+        self._system_notices.append((line, max(1, ttl)))
+
+    def _consume_system_notices(self) -> list[str]:
+        if not self._system_notices:
+            return []
+        out: list[str] = []
+        next_items: list[tuple[str, int]] = []
+        for line, ttl in self._system_notices:
+            out.append(line)
+            if ttl - 1 > 0:
+                next_items.append((line, ttl - 1))
+        self._system_notices = next_items
+        return out
 
     def _sync_main_panel_binding(self) -> None:
         target_task_id = self.log_view_task_id or self.foreground_task_id
@@ -583,6 +602,9 @@ class ParagentsTUI:
                 phase = self._watch_phase_by_task.get(self.foreground_task_id, "thinking...")
                 task_ref = self._task_ref(self.foreground_task_id)
                 lines.append(f"{self._spinner_frames[self._spinner_idx]} assistant({task_ref}): {phase}")
+        if self._pinned_command_ttl > 0 and self._pinned_command_lines:
+            lines.extend(self._pinned_command_lines)
+            self._pinned_command_ttl -= 1
         return lines
 
     def _main_panel_wrap_width(self) -> int:
@@ -652,20 +674,32 @@ class ParagentsTUI:
         if self.show_welcome:
             return self._welcome_text()
         lines = self._slice_main_panel_lines(self._main_panel_lines())
+        notices = self._consume_system_notices()
         header = self._main_panel_header_line()
         if header is None:
-            return "\n".join(lines)
-        body_limit = max(1, self._log_line_limit() - 1)
+            body_limit = max(1, self._log_line_limit() - len(notices))
+            body = lines[-body_limit:] if len(lines) > body_limit else lines
+            return "\n".join([*notices, *body])
+        body_limit = max(1, self._log_line_limit() - 1 - len(notices))
         body = lines[-body_limit:] if len(lines) > body_limit else lines
-        return "\n".join([header, *body])
+        return "\n".join([header, *notices, *body])
 
     def _log_panel_formatted(self) -> list[tuple[str, str]]:
         text = self._log_panel_text()
         fragments: list[tuple[str, str]] = []
         approval_active = self._is_current_panel_task_waiting_approval()
-        for line in text.splitlines():
+        active_ref = self._current_pending_request_ref().lower()
+        text_lines = text.splitlines()
+        for idx, line in enumerate(text_lines):
             lower = line.lower()
-            if approval_active and ("approval" in lower or "request_id=" in lower) and self._blink_on:
+            window_lower = "\n".join(text_lines[max(0, idx - 2) : idx + 3]).lower()
+            if (
+                approval_active
+                and active_ref
+                and active_ref in window_lower
+                and ("approval" in lower or "request_id=" in lower or active_ref in lower)
+                and self._blink_on
+            ):
                 fragments.append(("class:status.approval", line + "\n"))
             elif ("[x failed]" in lower or "failed:" in lower) and self._blink_on:
                 fragments.append(("class:status.failed", line + "\n"))
@@ -691,6 +725,18 @@ class ParagentsTUI:
             return True
         pending_refs = set(self.approve_candidate_request_refs_provider())
         return self._request_ref(request_id) in pending_refs
+
+    def _current_pending_request_ref(self) -> str:
+        task_id = self.log_view_task_id or self.foreground_task_id
+        if not task_id:
+            return ""
+        task = self.scheduler.tasks.get(task_id)
+        if task is None:
+            return ""
+        request_id = str(getattr(task, "local_state", {}).get("pending_approval_request_id", "")).strip()
+        if not request_id:
+            return ""
+        return self._request_ref(request_id)
 
     def _extract_task_short_id(self, line: str) -> str | None:
         m = re.search(r"assistant\(([0-9a-f]{6})\)", line)
@@ -968,12 +1014,19 @@ class ParagentsTUI:
         lines = text.splitlines()
         fragments: list[tuple[str, str]] = []
         request_line_style = ""
+        active_request_ref = ""
         if v.status == "paused" and self._is_request_still_pending(v.pending_approval_request_id):
             request_line_style = "class:status.approval" if self._blink_on else ""
+            active_request_ref = self._request_ref(v.pending_approval_request_id).lower()
         for line_idx, line in enumerate(lines):
             if line_idx == 1 and style:
                 fragments.append((style, line + "\n"))
-            elif "request_id=" in line and request_line_style:
+            elif (
+                request_line_style
+                and ("request_id=" in line or "approval" in line.lower())
+                and active_request_ref
+                and active_request_ref in line.lower()
+            ):
                 fragments.append((request_line_style, line + "\n"))
             else:
                 fragments.append(("", line + "\n"))
@@ -1059,6 +1112,7 @@ class ParagentsTUI:
                 self._apply_selected_option()
                 return
             if self.context_popup_mode is not None:
+                # 仅当有候选时，Enter 用于回填；无候选时应继续执行输入命令。
                 if self.context_candidates:
                     self._apply_context_selection()
                     event.app.layout.focus(self.parts.command_bar)
@@ -1070,17 +1124,23 @@ class ParagentsTUI:
             if raw.isdigit() or re.fullmatch(r"\d+(?:/\d+)+", raw):
                 cmd = raw
             else:
-                cmd = raw.lower() if raw.lower() in {"y", "n"} else normalize_tui_command(raw)
+                if raw.lower() in {"y", "n"}:
+                    cmd = raw.lower()
+                else:
+                    normalized = normalize_tui_command(raw)
+                    cmd = f"__slash__ {normalized}" if raw.startswith("/") else normalized
             self.show_welcome = False
             if cmd:
+                effective_cmd = cmd[len("__slash__ ") :].strip() if cmd.startswith("__slash__ ") else cmd
                 display = raw if raw else cmd
                 # submit 是后台任务提交，不污染 foreground 主面板日志。
-                if not cmd.startswith("submit "):
+                if not effective_cmd.startswith("submit "):
                     self._append_main_log(self._format_you(display))
-                if cmd in {"quit", "exit"}:
+                if effective_cmd in {"quit", "exit"}:
                     event.app.exit()
                 else:
-                    event.app.create_background_task(self._run_command(cmd))
+                    bg_task = event.app.create_background_task(self._run_command(cmd))
+                    bg_task.add_done_callback(self._on_command_task_done)
             self.input_buffer.text = ""
             event.app.layout.focus(self.parts.command_bar)
 
@@ -1127,24 +1187,45 @@ class ParagentsTUI:
         return kb
 
     async def _run_command(self, cmd: str) -> None:
-        output = await self.command_handler(cmd)
-        if self.foreground_task_id_provider is not None or self.task_slot_ids_provider is not None:
-            self._refresh_external_state()
-        if cmd in {"y", "n"} and self.foreground_task_id:
-            self._pending_approval_by_task.pop(self.foreground_task_id, None)
-        if output and output[0] == "unknown command":
-            output = [
-                f"不支持的指令: {cmd}",
-                "可用命令: /new, /run, /submit, /list, /show, /log, /finish, /approvals, /approve, /deny, /pause, /resume, /cancel, /quit",
-                "提示: 非 / 开头输入会自动按有无 foreground 映射为 /new 或 /run。",
-            ]
-        # submit 的结果只体现在 submit 面板；主面板保持 foreground 纯净。
-        if not cmd.startswith("submit "):
+        try:
+            # 用户主动执行命令时，自动退出回看偏移，回到底部跟随最新输出。
+            self._side_log_back_offset = 0
+            effective_cmd = cmd[len("__slash__ ") :].strip() if cmd.startswith("__slash__ ") else cmd
+            output = await self.command_handler(cmd)
+            if self.foreground_task_id_provider is not None or self.task_slot_ids_provider is not None:
+                self._refresh_external_state()
+            if effective_cmd in {"y", "n"} and self.foreground_task_id:
+                self._pending_approval_by_task.pop(self.foreground_task_id, None)
+            if output and output[0] == "unknown command":
+                output = [
+                    f"不支持的指令: {effective_cmd}",
+                    "可用命令: /new, /run, /submit, /list, /show, /log, /finish, /approvals, /approve, /deny, /pause, /resume, /cancel, /quit",
+                    "提示: 非 / 开头输入会自动按有无 foreground 映射为 /new 或 /run。",
+                ]
             lines = self._shorten_ids(output if output else ["(no output)"])
-            lines = [line for line in lines if not line.startswith("continued in foreground:")]
-            self._extend_main_logs([self._format_par(line) for line in lines])
-        self._request_redraw()
-        self.app.layout.focus(self.parts.command_bar)
+            if any("槽位已满" in line for line in lines):
+                for line in lines:
+                    self._push_system_notice(self._format_par(line), ttl=2)
+            elif not effective_cmd.startswith("submit "):
+                lines = [line for line in lines if not line.startswith("continued in foreground:")]
+                self._extend_main_logs([self._format_par(line) for line in lines])
+            self._request_redraw()
+            self.app.layout.focus(self.parts.command_bar)
+        except Exception as exc:  # noqa: BLE001
+            self._append_main_log(self._format_par(f"[TUI ERROR] command '{cmd}' failed: {exc}"))
+            for line in traceback.format_exception_only(type(exc), exc):
+                self._append_main_log(self._format_par(f"[TUI ERROR] {line.strip()}"))
+            self._request_redraw()
+            self.app.layout.focus(self.parts.command_bar)
+
+    def _on_command_task_done(self, task: asyncio.Task[None]) -> None:
+        try:
+            task.result()
+        except Exception as exc:  # noqa: BLE001
+            self._append_main_log(self._format_par(f"[TUI ERROR] background command task failed: {exc}"))
+            for line in traceback.format_exception_only(type(exc), exc):
+                self._append_main_log(self._format_par(f"[TUI ERROR] {line.strip()}"))
+            self._request_redraw()
 
     def _request_redraw(self) -> None:
         try:

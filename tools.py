@@ -14,7 +14,7 @@ from mcp_runtime import MCPRegistry
 from permissions import PermissionManager
 
 ToolFunc = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
-SubmitSubagentFunc = Callable[[str, dict[str, ToolFunc]], Awaitable[str]]
+SubmitSubagentFunc = Callable[[str, dict[str, ToolFunc], str | None, str | None], Awaitable[str]]
 ScheduleFunc = Callable[[float, str, dict[str, ToolFunc]], Awaitable[str]]
 CancelScheduledFunc = Callable[[str], Awaitable[bool]]
 ListScheduledFunc = Callable[[], dict[str, float]]
@@ -156,8 +156,14 @@ def _build_spawn_tool(permission_manager: PermissionManager, submit_subagent: Su
         input_text = str(args.get("input", "")).strip()
         if not input_text:
             return {"ok": False, "error": "Missing input"}
+        parent_task_id = str(args.get("_task_id", "")).strip() or None
+        lineage_root_id = str(args.get("_lineage_root_id", "")).strip() or parent_task_id
         sub_tools = create_subagent_tools(permission_manager)
-        task_id = await submit_subagent(input_text, sub_tools)
+        try:
+            task_id = await submit_subagent(input_text, sub_tools, parent_task_id, lineage_root_id)
+        except TypeError:
+            # 兼容旧签名 submit_subagent(input_text, tools)
+            task_id = await submit_subagent(input_text, sub_tools)  # type: ignore[misc]
         return {"ok": True, "task_id": task_id}
 
     return _tool
@@ -165,7 +171,8 @@ def _build_spawn_tool(permission_manager: PermissionManager, submit_subagent: Su
 
 def _build_git_tool(permission_manager: PermissionManager, action: str) -> ToolFunc:
     async def _tool(args: dict[str, Any]) -> dict[str, Any]:
-        decision = permission_manager.check_git_action(action)
+        task_id = str(args.get("_task_id", "")).strip() or None
+        decision = permission_manager.check_git_action(action, task_id=task_id)
         if not decision.allowed:
             if decision.request_id:
                 return {
@@ -180,21 +187,21 @@ def _build_git_tool(permission_manager: PermissionManager, action: str) -> ToolF
             remote = str(args.get("remote", "origin"))
             branch = str(args.get("branch", "main"))
             command = f"git push {remote} {branch}"
-            return await run_command_tool({"command": command}, permission_manager)
+            return await run_command_tool({"command": command, **args}, permission_manager)
         if action == "status":
-            return await run_command_tool({"command": "git status --short"}, permission_manager)
+            return await run_command_tool({"command": "git status --short", **args}, permission_manager)
         if action == "diff":
-            return await run_command_tool({"command": "git diff"}, permission_manager)
+            return await run_command_tool({"command": "git diff", **args}, permission_manager)
         if action == "log":
-            return await run_command_tool({"command": "git log --oneline -n 20"}, permission_manager)
+            return await run_command_tool({"command": "git log --oneline -n 20", **args}, permission_manager)
         if action == "add":
             pathspec = str(args.get("pathspec", "."))
-            return await run_command_tool({"command": f"git add {pathspec}"}, permission_manager)
+            return await run_command_tool({"command": f"git add {pathspec}", **args}, permission_manager)
         if action == "commit":
             message = str(args.get("message", "")).strip()
             if not message:
                 return {"ok": False, "error": "Missing commit message"}
-            return await run_command_tool({"command": f"git commit -m \"{message}\""}, permission_manager)
+            return await run_command_tool({"command": f"git commit -m \"{message}\"", **args}, permission_manager)
         return {"ok": False, "error": f"Unsupported git action: {action}"}
 
     return _tool
@@ -206,7 +213,8 @@ def _build_github_api_tool(permission_manager: PermissionManager) -> ToolFunc:
         path = str(args.get("path", "")).strip()
         if not path:
             return {"ok": False, "error": "Missing path"}
-        decision = permission_manager.check_github_request(method, path)
+        task_id = str(args.get("_task_id", "")).strip() or None
+        decision = permission_manager.check_github_request(method, path, task_id=task_id)
         if not decision.allowed:
             if decision.request_id:
                 return {
@@ -459,7 +467,9 @@ async def run_command_tool(args: dict[str, Any], permission_manager: PermissionM
     if tokens and tokens[0] in {"python", "python3"}:
         return await run_python_tool({"command": command, "timeout_s": args.get("timeout_s", 10)}, permission_manager)
 
-    cap_decision = permission_manager.check_capability_decision("shell")
+    task_id = str(args.get("_task_id", "")).strip() or None
+    run_dir = str(args.get("_task_run_dir", "")).strip()
+    cap_decision = permission_manager.check_capability_decision("shell", task_id=task_id)
     if not cap_decision.allowed:
         return {
             "ok": False,
@@ -469,7 +479,7 @@ async def run_command_tool(args: dict[str, Any], permission_manager: PermissionM
             **_approval_meta(permission_manager, cap_decision.request_id),
         }
 
-    decision = permission_manager.check_shell_command(command)
+    decision = permission_manager.check_shell_command(command, task_id=task_id)
     if not decision.allowed:
         if decision.request_id:
             return {
@@ -488,6 +498,7 @@ async def run_command_tool(args: dict[str, Any], permission_manager: PermissionM
             command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            cwd=run_dir or None,
         )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
@@ -522,7 +533,9 @@ async def run_python_tool(args: dict[str, Any], permission_manager: PermissionMa
             safe_args = []
         command = " ".join([py, script, *safe_args]).strip()
 
-    decision = permission_manager.check_python_command(command)
+    task_id = str(args.get("_task_id", "")).strip() or None
+    run_dir = str(args.get("_task_run_dir", "")).strip()
+    decision = permission_manager.check_python_command(command, task_id=task_id)
     if not decision.allowed:
         if decision.request_id:
             return {
@@ -551,6 +564,7 @@ async def run_python_tool(args: dict[str, Any], permission_manager: PermissionMa
             *tokens,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            cwd=run_dir or None,
         )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
