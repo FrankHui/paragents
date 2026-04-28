@@ -63,7 +63,8 @@ class ApprovalRequest:
     request_type: str
     payload: dict[str, str]
     request_ref: str = ""
-    owner_task_id: str | None = None
+    owner_prompt_id: str | None = None
+    owner_session_id: str | None = None
     status: str = "pending"
 
     def __post_init__(self) -> None:
@@ -94,8 +95,12 @@ class PermissionManager:
         self._session_approved_github_actions: dict[str, set[str]] = {}
         self._session_enabled_capabilities: dict[str, set[str]] = {}
 
-    def _scope(self, task_id: str | None) -> str:
-        return task_id or "__global__"
+    def _scope(self, prompt_id: str | None = None, session_id: str | None = None) -> str:
+        if session_id:
+            return f"session:{session_id}"
+        if prompt_id:
+            return f"prompt:{prompt_id}"
+        return "__global__"
 
     @classmethod
     def load_or_create(cls) -> "PermissionManager":
@@ -137,15 +142,19 @@ class PermissionManager:
         }
         self._config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def check_capability(self, capability: str, task_id: str | None = None) -> bool:
-        scope = self._scope(task_id)
+    def check_capability(
+        self, capability: str, prompt_id: str | None = None, session_id: str | None = None
+    ) -> bool:
+        scope = self._scope(prompt_id=prompt_id, session_id=session_id)
         if capability in self._session_enabled_capabilities.get(scope, set()):
             return True
         return bool(self._config.capabilities.get(capability, False))
 
-    def check_capability_decision(self, capability: str, task_id: str | None = None) -> PermissionDecision:
-        scope = self._scope(task_id)
-        if self.check_capability(capability, task_id=task_id):
+    def check_capability_decision(
+        self, capability: str, prompt_id: str | None = None, session_id: str | None = None
+    ) -> PermissionDecision:
+        scope = self._scope(prompt_id=prompt_id, session_id=session_id)
+        if self.check_capability(capability, prompt_id=prompt_id, session_id=session_id):
             return PermissionDecision(allowed=True)
         existing = self._pending_capability_by_name.get((scope, capability))
         if existing and self._pending.get(existing) and self._pending[existing].status == "pending":
@@ -162,7 +171,8 @@ class PermissionManager:
             request_ref=request_ref,
             request_type="capability_enable",
             payload={"capability": capability},
-            owner_task_id=task_id,
+            owner_prompt_id=prompt_id,
+            owner_session_id=session_id,
         )
         self._pending_capability_by_name[(scope, capability)] = request_id
         return PermissionDecision(
@@ -201,8 +211,10 @@ class PermissionManager:
             reason=f"Path not in allowed scope for {mode}",
         )
 
-    def check_shell_command(self, command: str, task_id: str | None = None) -> PermissionDecision:
-        scope = self._scope(task_id)
+    def check_shell_command(
+        self, command: str, prompt_id: str | None = None, session_id: str | None = None
+    ) -> PermissionDecision:
+        scope = self._scope(prompt_id=prompt_id, session_id=session_id)
         normalized = command.strip()
         lowered = normalized.lower()
         policy = self._config.shell_policy
@@ -237,7 +249,8 @@ class PermissionManager:
                     request_ref=request_ref,
                     request_type="shell_command",
                     payload={"command": normalized},
-                    owner_task_id=task_id,
+                    owner_prompt_id=prompt_id,
+                    owner_session_id=session_id,
                 )
                 self._pending_shell_by_command[(scope, normalized)] = request_id
                 return PermissionDecision(
@@ -248,9 +261,11 @@ class PermissionManager:
 
         return PermissionDecision(allowed=True)
 
-    def check_python_command(self, command: str, task_id: str | None = None) -> PermissionDecision:
-        scope = self._scope(task_id)
-        cap_decision = self.check_capability_decision("python", task_id=task_id)
+    def check_python_command(
+        self, command: str, prompt_id: str | None = None, session_id: str | None = None
+    ) -> PermissionDecision:
+        scope = self._scope(prompt_id=prompt_id, session_id=session_id)
+        cap_decision = self.check_capability_decision("python", prompt_id=prompt_id, session_id=session_id)
         if not cap_decision.allowed:
             return cap_decision
 
@@ -288,7 +303,8 @@ class PermissionManager:
                     request_ref=request_ref,
                     request_type="python_command",
                     payload={"command": normalized},
-                    owner_task_id=task_id,
+                    owner_prompt_id=prompt_id,
+                    owner_session_id=session_id,
                 )
                 self._pending_python_by_command[(scope, normalized)] = request_id
                 return PermissionDecision(
@@ -299,9 +315,11 @@ class PermissionManager:
 
         return PermissionDecision(allowed=True)
 
-    def check_git_action(self, action: str, task_id: str | None = None) -> PermissionDecision:
-        scope = self._scope(task_id)
-        cap_decision = self.check_capability_decision("git", task_id=task_id)
+    def check_git_action(
+        self, action: str, prompt_id: str | None = None, session_id: str | None = None
+    ) -> PermissionDecision:
+        scope = self._scope(prompt_id=prompt_id, session_id=session_id)
+        cap_decision = self.check_capability_decision("git", prompt_id=prompt_id, session_id=session_id)
         if not cap_decision.allowed:
             return cap_decision
         normalized = action.strip().lower()
@@ -322,15 +340,18 @@ class PermissionManager:
                 request_ref=request_ref,
                 request_type="git_action",
                 payload={"action": normalized},
-                owner_task_id=task_id,
+                owner_prompt_id=prompt_id,
+                owner_session_id=session_id,
             )
             self._pending_git_by_action[(scope, normalized)] = request_id
             return PermissionDecision(False, request_id=request_id, reason=f"Git action requires approval: {normalized}")
         return PermissionDecision(allowed=True)
 
-    def check_github_request(self, method: str, path: str, task_id: str | None = None) -> PermissionDecision:
-        scope = self._scope(task_id)
-        cap_decision = self.check_capability_decision("github", task_id=task_id)
+    def check_github_request(
+        self, method: str, path: str, prompt_id: str | None = None, session_id: str | None = None
+    ) -> PermissionDecision:
+        scope = self._scope(prompt_id=prompt_id, session_id=session_id)
+        cap_decision = self.check_capability_decision("github", prompt_id=prompt_id, session_id=session_id)
         if not cap_decision.allowed:
             return cap_decision
         normalized_method = method.strip().upper()
@@ -352,32 +373,51 @@ class PermissionManager:
                 request_ref=request_ref,
                 request_type="github_action",
                 payload={"action": key},
-                owner_task_id=task_id,
+                owner_prompt_id=prompt_id,
+                owner_session_id=session_id,
             )
             self._pending_github_by_action[(scope, key)] = request_id
             return PermissionDecision(False, request_id=request_id, reason=f"GitHub request needs approval: {key}")
         return PermissionDecision(allowed=True)
 
-    def list_pending(self, task_id: str | None = None) -> list[ApprovalRequest]:
-        if task_id is None:
+    def list_pending(self, prompt_id: str | None = None, session_id: str | None = None) -> list[ApprovalRequest]:
+        if prompt_id is None and session_id is None:
             return [r for r in self._pending.values() if r.status == "pending"]
-        return [r for r in self._pending.values() if r.status == "pending" and r.owner_task_id == task_id]
+        return [
+            r
+            for r in self._pending.values()
+            if r.status == "pending"
+            and (prompt_id is None or r.owner_prompt_id == prompt_id)
+            and (session_id is None or r.owner_session_id == session_id)
+        ]
 
-    def get_pending(self, request_id: str, task_id: str | None = None) -> ApprovalRequest | None:
+    def get_pending(
+        self, request_id: str, prompt_id: str | None = None, session_id: str | None = None
+    ) -> ApprovalRequest | None:
         req = self._pending.get(request_id)
         if req is None or req.status != "pending":
             return None
-        if task_id is not None and req.owner_task_id != task_id:
+        if prompt_id is not None and req.owner_prompt_id != prompt_id:
+            return None
+        if session_id is not None and req.owner_session_id != session_id:
             return None
         return req
 
-    def approve(self, request_id: str, always: bool = False, task_id: str | None = None) -> bool:
+    def approve(
+        self,
+        request_id: str,
+        always: bool = False,
+        prompt_id: str | None = None,
+        session_id: str | None = None,
+    ) -> bool:
         req = self._pending.get(request_id)
         if req is None or req.status != "pending":
             return False
-        if task_id is not None and req.owner_task_id != task_id:
+        if prompt_id is not None and req.owner_prompt_id != prompt_id:
             return False
-        scope = self._scope(req.owner_task_id)
+        if session_id is not None and req.owner_session_id != session_id:
+            return False
+        scope = self._scope(prompt_id=req.owner_prompt_id, session_id=req.owner_session_id)
         req.status = "approved"
         if req.request_type == "fs_scope":
             path = req.payload["path"]
@@ -421,13 +461,15 @@ class PermissionManager:
                 self.save()
         return True
 
-    def deny(self, request_id: str, task_id: str | None = None) -> bool:
+    def deny(self, request_id: str, prompt_id: str | None = None, session_id: str | None = None) -> bool:
         req = self._pending.get(request_id)
         if req is None or req.status != "pending":
             return False
-        if task_id is not None and req.owner_task_id != task_id:
+        if prompt_id is not None and req.owner_prompt_id != prompt_id:
             return False
-        scope = self._scope(req.owner_task_id)
+        if session_id is not None and req.owner_session_id != session_id:
+            return False
+        scope = self._scope(prompt_id=req.owner_prompt_id, session_id=req.owner_session_id)
         req.status = "denied"
         if req.request_type == "shell_command":
             command = req.payload.get("command")

@@ -16,7 +16,17 @@ from main import (
 )
 from permissions import FsScope, PermissionManager, PermissionsConfig
 from scheduler import Scheduler
-from task import Task
+from task import Prompt
+def Task(**kwargs):  # type: ignore[misc]
+    if "task_id" in kwargs:
+        kwargs["prompt_id"] = kwargs.pop("task_id")
+    if "task_ref" in kwargs:
+        kwargs["prompt_ref"] = kwargs.pop("task_ref")
+    p = Prompt(**kwargs)
+    p.task_id = p.prompt_id  # type: ignore[attr-defined]
+    p.task_ref = p.prompt_ref  # type: ignore[attr-defined]
+    return p
+
 
 
 def _build_manager(tmp_path):
@@ -64,7 +74,7 @@ def test_handle_run_approval_answer_approve_resumes(tmp_path) -> None:
     scheduler = Scheduler(llm_client=None)
     task = Task(task_id="task-123456", input="x", status="paused")
     task.local_state["pending_approval_request_id"] = request_id
-    scheduler.tasks[task.task_id] = task
+    scheduler.prompts[task.task_id] = task
 
     lines = asyncio.run(_handle_run_approval_answer("y", request_id, manager, scheduler))
     assert any("approved" in line for line in lines)
@@ -80,10 +90,10 @@ def test_handle_run_approval_answer_deny(tmp_path) -> None:
     scheduler = Scheduler(llm_client=None)
     task = Task(task_id="task-deny-base", input="x", status="paused")
     task.local_state["pending_approval_request_id"] = request_id
-    scheduler.tasks[task.task_id] = task
+    scheduler.prompts[task.task_id] = task
     lines = asyncio.run(_handle_run_approval_answer("n", request_id, manager, scheduler))
     assert any(line.startswith(f"denied {pending_req.request_ref}") for line in lines)
-    assert any("failed tasks:" in line for line in lines)
+    assert any("failed sessions:" in line for line in lines)
     assert task.status == "failed"
 
 
@@ -95,11 +105,11 @@ def test_handle_run_approval_answer_deny_fails_waiting_task(tmp_path) -> None:
     scheduler = Scheduler(llm_client=None)
     task = Task(task_id="task-deny-1", input="x", status="paused")
     task.local_state["pending_approval_request_id"] = request_id
-    scheduler.tasks[task.task_id] = task
+    scheduler.prompts[task.task_id] = task
 
     lines = asyncio.run(_handle_run_approval_answer("n", request_id, manager, scheduler))
     assert any(line.startswith("denied ") for line in lines)
-    assert any("failed tasks:" in line for line in lines)
+    assert any("failed sessions:" in line for line in lines)
     assert task.status == "failed"
 
 
@@ -120,8 +130,8 @@ def test_watch_slot_blocking_only_for_active_status() -> None:
     scheduler = Scheduler(llm_client=None)
     running = Task(task_id="run-1", input="x", status="running")
     completed = Task(task_id="done-1", input="x", status="completed")
-    scheduler.tasks[running.task_id] = running
-    scheduler.tasks[completed.task_id] = completed
+    scheduler.prompts[running.task_id] = running
+    scheduler.prompts[completed.task_id] = completed
     assert _is_watch_slot_blocking(scheduler, running.task_id) is True
     assert _is_watch_slot_blocking(scheduler, completed.task_id) is False
     assert _is_watch_slot_blocking(scheduler, "missing") is False
@@ -134,8 +144,8 @@ def test_get_active_approval_request_id_prefers_foreground_watch() -> None:
     run_task.local_state["pending_approval_request_id"] = "req-run"
     watch_task = Task(task_id="watch-1", input="x", status="paused")
     watch_task.local_state["pending_approval_request_id"] = "req-watch"
-    scheduler.tasks[run_task.task_id] = run_task
-    scheduler.tasks[watch_task.task_id] = watch_task
+    scheduler.prompts[run_task.task_id] = run_task
+    scheduler.prompts[watch_task.task_id] = watch_task
 
     assert _get_active_approval_request_id(scheduler, run_task.task_id, watch_task.task_id) == "req-watch"
     assert _get_active_approval_request_id(scheduler, None, watch_task.task_id) == "req-watch"
@@ -146,7 +156,7 @@ def test_scheduler_continue_task_reuses_same_task_id() -> None:
     scheduler = Scheduler(llm_client=None)
     task = Task(task_id="keep-1", input="first", status="completed")
     task.local_state["initial_input"] = "first"
-    scheduler.tasks[task.task_id] = task
+    scheduler.prompts[task.task_id] = task
     scheduler._task_tools[task.task_id] = {}  # noqa: SLF001
     ok = asyncio.run(scheduler.continue_task(task.task_id, "hello"))
     assert ok is True

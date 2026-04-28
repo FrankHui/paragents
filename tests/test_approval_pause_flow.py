@@ -4,7 +4,17 @@ import asyncio
 
 from agent_instance import AgentInstance
 from scheduler import Scheduler
-from task import Task
+from task import Prompt
+def Task(**kwargs):  # type: ignore[misc]
+    if "task_id" in kwargs:
+        kwargs["prompt_id"] = kwargs.pop("task_id")
+    if "task_ref" in kwargs:
+        kwargs["prompt_ref"] = kwargs.pop("task_ref")
+    p = Prompt(**kwargs)
+    p.task_id = p.prompt_id  # type: ignore[attr-defined]
+    p.task_ref = p.prompt_ref  # type: ignore[attr-defined]
+    return p
+
 from tools import ToolRegistry
 
 
@@ -55,10 +65,10 @@ def test_scheduler_resume_requeues_approval_paused_task() -> None:
     scheduler = Scheduler(llm_client=None, max_in_flight=1)
     task = Task(task_id="t1", input="x", status="paused")
     task.local_state["pending_approval_request_id"] = "req-1"
-    scheduler.tasks["t1"] = task
+    scheduler.prompts["t1"] = task
 
     asyncio.run(scheduler.resume("t1"))
-    assert scheduler.tasks["t1"].status == "pending"
+    assert scheduler.prompts["t1"].status == "pending"
 
 
 async def _stream_tool(args):  # noqa: ANN001

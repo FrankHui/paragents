@@ -46,7 +46,7 @@ def test_spawn_uses_subagent_toolset(tmp_path: Path) -> None:
     main = create_main_tools(mgr, submit_subagent=_submit, mcp_registry=None)
     result = asyncio.run(main["spawn"]({"input": "hello"}))
     assert result["ok"] is True
-    assert result["task_id"] == "sub-task-id"
+    assert result["prompt_id"] == "sub-task-id"
     assert "spawn" not in captured["tool_names"]
 
 

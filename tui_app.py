@@ -202,9 +202,8 @@ class ParagentsTUI:
                 "/run",
                 "/submit",
                 "/list",
-                "/show",
-                "/log",
-                "/finish",
+                "/switch",
+                "/close",
                 "/approvals",
                 "/approve",
                 "/deny",
@@ -222,9 +221,8 @@ class ParagentsTUI:
             "/run",
             "/submit",
             "/list",
-            "/show",
-            "/log",
-            "/finish",
+            "/switch",
+            "/close",
             "/approvals",
             "/approve",
             "/deny",
@@ -247,7 +245,7 @@ class ParagentsTUI:
         self.selected_task_id: str | None = None
         self.show_welcome = True
         self.show_options = False
-        self.context_popup_mode: str | None = None  # slash | finish | show | approve | deny | None
+        self.context_popup_mode: str | None = None  # slash | close | switch | approve | deny | None
         self.context_candidates: list[tuple[str, str]] = []
         self.context_selected = 0
         self._session_command_history: dict[str, list[str]] = {}
@@ -256,9 +254,8 @@ class ParagentsTUI:
             ("/run <task>", "/run "),
             ("/list", "/list"),
             ("/approvals", "/approvals"),
-            ("/show <session_id>", "/show "),
-            ("/log <session_id>", "/log "),
-            ("/finish <session_id>", "/finish "),
+            ("/switch <session_id>", "/switch "),
+            ("/close <session_id>", "/close "),
             ("/approve <id>", "/approve "),
             ("/deny <id>", "/deny "),
             ("/pause <task_id>", "/pause "),
@@ -399,6 +396,43 @@ class ParagentsTUI:
             return task_id[:6]
         return str(getattr(task, "prompt_ref", task_id[:6]))
 
+    def _session_seed_content(self, session_id: str, max_len: int = 52) -> str:
+        task_ids: list[str] = []
+        getter = getattr(self.scheduler, "get_session_task_ids", None)
+        if callable(getter):
+            task_ids = getter(session_id)
+        elif session_id in self.scheduler.prompts:
+            task_ids = [session_id]
+        if not task_ids:
+            return "(empty)"
+        prompts = [self.scheduler.prompts[tid] for tid in task_ids if tid in self.scheduler.prompts]
+        if not prompts:
+            return "(empty)"
+        prompts.sort(key=lambda p: getattr(p, "created_at", 0.0))
+        seed = prompts[0]
+        text = str(getattr(seed, "local_state", {}).get("initial_input", "")).strip() or str(getattr(seed, "input", "")).strip()
+        text = " ".join(text.split())
+        if len(text) > max_len:
+            return text[: max_len - 3] + "..."
+        return text or "(empty)"
+
+    def _session_ref_by_id(self, session_id: str) -> str:
+        if not session_id:
+            return "-"
+        if self.session_ref_resolver is not None:
+            return self.session_ref_resolver(session_id)
+        get_ref = getattr(self.scheduler, "get_session_ref", None)
+        if callable(get_ref):
+            with contextlib.suppress(Exception):
+                return str(get_ref(session_id))
+        return session_id[:6]
+
+    def _session_ref_by_task(self, task_id: str) -> str:
+        session_id = self.scheduler.get_prompt_session_id(task_id) or ""
+        if not session_id:
+            return self._task_ref(task_id)
+        return self._session_ref_by_id(session_id)
+
     def _request_ref(self, request_id: str) -> str:
         rid = request_id.strip()
         if not rid:
@@ -471,10 +505,10 @@ class ParagentsTUI:
         mode: str | None = None
         if lower.startswith("/"):
             command_head = lower.split(" ", 1)[0]
-            if command_head in {"/finish", "/show", "/approve", "/deny"}:
+            if command_head in {"/close", "/switch", "/approve", "/deny"}:
                 mode_map = {
-                    "/finish": "finish",
-                    "/show": "show",
+                    "/close": "close",
+                    "/switch": "switch",
                     "/approve": "approve",
                     "/deny": "deny",
                 }
@@ -489,10 +523,10 @@ class ParagentsTUI:
                 mode = None
             else:
                 mode = "slash"
-        elif re.fullmatch(r"finish(?:\s.*)?", lower):
-            mode = "finish"
-        elif re.fullmatch(r"show(?:\s.*)?", lower):
-            mode = "show"
+        elif re.fullmatch(r"close(?:\s.*)?", lower):
+            mode = "close"
+        elif re.fullmatch(r"switch(?:\s.*)?", lower):
+            mode = "switch"
         elif re.fullmatch(r"approve(?:\s.*)?", lower):
             mode = "approve"
         elif re.fullmatch(r"deny(?:\s.*)?", lower):
@@ -560,7 +594,7 @@ class ParagentsTUI:
                 return []
             matched = [cmd for cmd in self._slash_commands if cmd.startswith(prefix)]
             return [(cmd, cmd) for cmd in matched]
-        if mode == "finish":
+        if mode == "close":
             if (
                 self.session_slot_ids_provider is not None
                 and self.session_ref_resolver is not None
@@ -574,11 +608,9 @@ class ParagentsTUI:
                     task = self.scheduler.prompts.get(active_task_id)
                     if task is None:
                         continue
-                    session_ref = self.session_ref_resolver(session_id)
-                    status = str(getattr(task, "status", ""))
-                    logs = self.scheduler.get_prompt_logs(active_task_id, limit=1)
-                    latest = self._compact_ids_in_text(logs[-1]) if logs else ""
-                    result.append((session_ref, f"{session_ref} [{status}] {latest}"))
+                    seed = self._session_seed_content(session_id, max_len=52)
+                    session_ref = self._session_ref_by_id(session_id)
+                    result.append((session_ref, f"{session_ref} {seed}"))
                 return result
             provider = self.finish_candidate_task_ids_provider
             if provider is None:
@@ -588,12 +620,12 @@ class ParagentsTUI:
                 task = self.scheduler.prompts.get(task_id)
                 if task is None:
                     continue
-                status = str(getattr(task, "status", ""))
-                logs = self.scheduler.get_prompt_logs(task_id, limit=1)
-                latest = self._compact_ids_in_text(logs[-1]) if logs else ""
-                result.append((self._task_ref(task_id), f"{self._task_ref(task_id)} [{status}] {latest}"))
+                session_id = self.scheduler.get_prompt_session_id(task_id) or ""
+                seed = self._session_seed_content(session_id, max_len=52) if session_id else "(empty)"
+                token = self._session_ref_by_task(task_id)
+                result.append((token, f"{token} {seed}"))
             return result
-        if mode == "show":
+        if mode == "switch":
             provider = self.show_candidate_task_ids_provider
             if provider is None:
                 return []
@@ -602,10 +634,10 @@ class ParagentsTUI:
                 task = self.scheduler.prompts.get(task_id)
                 if task is None:
                     continue
-                status = str(getattr(task, "status", ""))
-                logs = self.scheduler.get_prompt_logs(task_id, limit=1)
-                latest = self._compact_ids_in_text(logs[-1]) if logs else ""
-                result.append((self._task_ref(task_id), f"{self._task_ref(task_id)} [{status}] {latest}"))
+                session_id = self.scheduler.get_prompt_session_id(task_id) or ""
+                seed = self._session_seed_content(session_id, max_len=52) if session_id else "(empty)"
+                token = self._session_ref_by_task(task_id)
+                result.append((token, f"{token} {seed}"))
             return result
         if mode == "session_run_history":
             session_id = self._current_session_id()
@@ -641,8 +673,8 @@ class ParagentsTUI:
         inner_width = 52
         title_map = {
             "slash": " COMMAND Candidates ",
-            "finish": " FINISH Candidates ",
-            "show": " SHOW Candidates ",
+            "close": " CLOSE Candidates ",
+            "switch": " SWITCH Candidates ",
             "approve": " APPROVE Candidates ",
             "deny": " DENY Candidates ",
             "session_run_history": " SESSION /RUN History ",
@@ -682,8 +714,8 @@ class ParagentsTUI:
         token, _ = self.context_candidates[idx]
         prefix_map = {
             "slash": "",
-            "finish": "/finish ",
-            "show": "/show ",
+            "close": "/close ",
+            "switch": "/switch ",
             "approve": "/approve ",
             "deny": "/deny ",
             "session_run_history": "",
@@ -725,7 +757,8 @@ class ParagentsTUI:
             cols = 120
         # Left(main) panel is roughly 7/11 of terminal width.
         panel_width = max(28, int(cols * (7 / 11)) - 2)
-        prefix = "Task: "
+        session_ref = self._session_ref_by_task(task_id)
+        prefix = f"Session(session_id={session_ref}): "
         text = self._truncate_to_display_width(raw, max(1, panel_width - len(prefix)))
         return f"{prefix}{text}"
 
@@ -867,9 +900,8 @@ class ParagentsTUI:
             "run ",
             "submit ",
             "list",
-            "show ",
-            "log ",
-            "finish ",
+            "switch ",
+            "close ",
             "approvals",
             "approve ",
             "deny ",
@@ -896,9 +928,8 @@ class ParagentsTUI:
         if normalized.startswith(
             (
                 "list",
-                "show ",
-                "log ",
-                "finish ",
+                "switch ",
+                "close ",
                 "approvals",
                 "approve ",
                 "deny ",
@@ -1259,8 +1290,8 @@ class ParagentsTUI:
             "╠══════════════════════════════════════════════════════════╣\n"
             "║ Welcome. Type command and press Enter.                   ║\n"
             "║ Capacity: total session slots <= 5                       ║\n"
-            "║ /show|/resume -> foreground | /log -> readonly history   ║\n"
-            "║ /finish <id> is required to release a session slot       ║\n"
+            "║ /switch|/resume -> foreground                             ║\n"
+            "║ /close <id> is required to release a session slot        ║\n"
             "║ Tab complete | Up/Down仅多行编辑 | Ctrl+R会话历史命令    ║\n"
             "║ Ctrl+X 取消运行中prompt | Ctrl+U 清空输入                ║\n"
             "║ Ctrl+C exit | Esc close welcome                          ║\n"
@@ -1330,7 +1361,7 @@ class ParagentsTUI:
         if status in {"failed", "cancelled"}:
             return ("[X FAILED]", "class:status.failed" if self._blink_on else "")
         if status == "completed":
-            return ("[✓ ACK]", "class:status.completed_ack" if self._blink_on else "")
+            return ("[✓ complete]", "class:status.completed_ack" if self._blink_on else "")
         if status == "paused":
             if self._is_request_still_pending(pending_request_id):
                 return ("[! APPROVAL]", "class:status.approval" if self._blink_on else "")
@@ -1386,8 +1417,9 @@ class ParagentsTUI:
 
         key_logs = [_clip_submit_line(self._compact_ids_in_text(line.strip())) for line in v.key_logs if line.strip()]
         key_logs_text = "\n".join(key_logs) if key_logs else _clip_submit_line(self._compact_ids_in_text((v.latest_log or "").strip()))
+        session_ref = self._session_ref_by_task(v.task_id)
         return (
-            f"{task_name}\n"
+            f"Session(session_id={session_ref}): {task_name}\n"
             f"{marker} {self._task_ref(v.task_id)}  r={v.retries}\n"
             f"status={v.status}\n"
             f"{key_logs_text or '(no logs)'}"
@@ -1628,7 +1660,7 @@ class ParagentsTUI:
             if output and output[0] == "unknown command":
                 output = [
                     f"不支持的指令: {effective_cmd}",
-                    "可用命令: /new, /run, /submit, /list, /show, /log, /finish, /approvals, /approve, /deny, /pause, /resume, /cancel, /quit",
+                    "可用命令: /new, /run, /submit, /list, /switch, /close, /approvals, /approve, /deny, /pause, /resume, /cancel, /quit",
                     "提示: 非 / 开头输入会自动按有无 foreground 映射为 /new 或 /run。",
                 ]
             lines = self._shorten_ids(output if output else ["(no output)"])
@@ -1687,7 +1719,7 @@ class ParagentsTUI:
                             self.foreground_task_id = task_id
                             self.log_view_task_id = None
                             return
-        if cmd.startswith("show "):
+        if cmd.startswith("switch "):
             token = cmd.split(" ", 1)[1].strip()
             task_id = self._resolve_task_id_token(token)
             if task_id:

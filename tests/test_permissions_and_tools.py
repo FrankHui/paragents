@@ -209,15 +209,15 @@ def test_shell_capability_disabled_requires_approval_then_allows(tmp_path: Path)
 
 def test_task_scoped_shell_approval_is_isolated(tmp_path: Path) -> None:
     manager = _build_manager(tmp_path, [FsScope(path=str(tmp_path), read=True, write=True)])
-    decision_a = manager.check_shell_command("python3 --version", task_id="task-A")
-    decision_b = manager.check_shell_command("python3 --version", task_id="task-B")
+    decision_a = manager.check_shell_command("python3 --version", prompt_id="task-A")
+    decision_b = manager.check_shell_command("python3 --version", prompt_id="task-B")
     assert decision_a.allowed is False and decision_b.allowed is False
     assert decision_a.request_id and decision_b.request_id
     assert decision_a.request_id != decision_b.request_id
 
-    assert manager.approve(decision_a.request_id, task_id="task-A") is True
-    allowed_a = manager.check_shell_command("python3 --version", task_id="task-A")
-    denied_b = manager.check_shell_command("python3 --version", task_id="task-B")
+    assert manager.approve(decision_a.request_id, prompt_id="task-A") is True
+    allowed_a = manager.check_shell_command("python3 --version", prompt_id="task-A")
+    denied_b = manager.check_shell_command("python3 --version", prompt_id="task-B")
     assert allowed_a.allowed is True
     assert denied_b.allowed is False
 
@@ -232,8 +232,8 @@ def test_task_run_dir_is_used_by_run_command(tmp_path: Path) -> None:
         tools["run_command"](
             {
                 "command": "pwd",
-                "_task_id": "task-1",
-                "_task_run_dir": str(run_dir),
+                "_prompt_id": "task-1",
+                "_prompt_run_dir": str(run_dir),
             }
         )
     )

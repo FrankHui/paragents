@@ -1,6 +1,16 @@
 from __future__ import annotations
 
-from task import Task
+from task import Prompt
+def Task(**kwargs):  # type: ignore[misc]
+    if "task_id" in kwargs:
+        kwargs["prompt_id"] = kwargs.pop("task_id")
+    if "task_ref" in kwargs:
+        kwargs["prompt_ref"] = kwargs.pop("task_ref")
+    p = Prompt(**kwargs)
+    p.task_id = p.prompt_id  # type: ignore[attr-defined]
+    p.task_ref = p.prompt_ref  # type: ignore[attr-defined]
+    return p
+
 from ui_cli import (
     clear_screen,
     colorize_watch_line,
@@ -20,7 +30,7 @@ def test_startup_banner_contains_core_info() -> None:
 
 
 def test_status_line_contains_counters() -> None:
-    line = format_status_line(in_flight=2, pending_approvals=1, watching_task_id="abc")
+    line = format_status_line(in_flight=2, pending_approvals=1, watching_prompt_id="abc")
     assert "in-flight=2" in line
     assert "approvals=1" in line
     assert "watch=abc" in line

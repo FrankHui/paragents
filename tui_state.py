@@ -1,13 +1,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Any, Literal
 
-from task import Task
+from task import Prompt
 
 
 @dataclass
-class TaskView:
+class PromptView:
+    task_id: str
+    task_ref: str
+    status: str
+    retries: int
+    updated_at: float
+    latest_log: str
+    key_logs: list[str]
+    pending_approval_request_id: str
+
+
+@dataclass
+class SessionView:
+    session_id: str
+    session_ref: str
     task_id: str
     task_ref: str
     status: str
@@ -28,15 +43,51 @@ class RuntimeSummary:
 TaskHighlight = Literal["normal", "approval_pause", "paused", "failed"]
 
 
-def build_task_views(tasks: dict[str, Task], logs_by_task: dict[str, list[str]]) -> list[TaskView]:
-    views: list[TaskView] = []
+def build_prompt_views(tasks: dict[str, Prompt], logs_by_task: dict[str, list[str]]) -> list[PromptView]:
+    views: list[PromptView] = []
     for task in tasks.values():
-        logs = logs_by_task.get(task.task_id, [])
+        logs = logs_by_task.get(task.prompt_id, [])
         latest = logs[-1] if logs else ""
         views.append(
-            TaskView(
-                task_id=task.task_id,
-                task_ref=str(getattr(task, "task_ref", task.task_id[:6])),
+            PromptView(
+                task_id=task.prompt_id,
+                task_ref=str(getattr(task, "prompt_ref", task.prompt_id[:6])),
+                status=task.status,
+                retries=task.retries,
+                updated_at=task.updated_at,
+                latest_log=latest,
+                key_logs=_extract_key_logs(logs),
+                pending_approval_request_id=str(task.local_state.get("pending_approval_request_id", "")),
+            )
+        )
+    views.sort(key=lambda v: v.updated_at, reverse=True)
+    return views
+
+
+def build_session_views(
+    tasks: dict[str, Prompt],
+    logs_by_task: dict[str, list[str]],
+    session_ids: list[str],
+    session_ref_resolver: Callable[[str], str],
+    active_task_resolver: Callable[[str], str | None],
+) -> list[SessionView]:
+    views: list[SessionView] = []
+    for session_id in session_ids:
+        active_task_id = active_task_resolver(session_id)
+        if not active_task_id:
+            continue
+        task = tasks.get(active_task_id)
+        if task is None:
+            continue
+        logs = logs_by_task.get(active_task_id, [])
+        latest = logs[-1] if logs else ""
+        task_ref = str(getattr(task, "prompt_ref", active_task_id[:6]))
+        views.append(
+            SessionView(
+                session_id=session_id,
+                session_ref=session_ref_resolver(session_id),
+                task_id=active_task_id,
+                task_ref=task_ref,
                 status=task.status,
                 retries=task.retries,
                 updated_at=task.updated_at,
@@ -72,7 +123,7 @@ def _extract_key_logs(logs: list[str]) -> list[str]:
     return key_logs if key_logs else logs
 
 
-def summarize_runtime(tasks: dict[str, Task], pending_approvals: int) -> RuntimeSummary:
+def summarize_runtime(tasks: dict[str, Prompt], pending_approvals: int) -> RuntimeSummary:
     in_flight = sum(1 for t in tasks.values() if t.status == "running")
     pending = sum(1 for t in tasks.values() if t.status == "pending")
     return RuntimeSummary(in_flight=in_flight, pending=pending, pending_approvals=pending_approvals)
@@ -95,7 +146,7 @@ def normalize_tui_command(cmd: str) -> str:
     return cmd
 
 
-def render_task_list(views: list[TaskView]) -> str:
+def render_prompt_list(views: list[PromptView]) -> str:
     if not views:
         return "(no tasks)"
     lines = []
@@ -105,7 +156,7 @@ def render_task_list(views: list[TaskView]) -> str:
     return "\n".join(lines)
 
 
-def render_progress(views: list[TaskView], selected_task_id: str | None) -> str:
+def render_progress(views: list[PromptView], selected_task_id: str | None) -> str:
     if not views:
         return "No task selected."
     selected = next((v for v in views if v.task_id == selected_task_id), views[0])
@@ -126,7 +177,7 @@ def render_progress(views: list[TaskView], selected_task_id: str | None) -> str:
     return f"{selected_ref} [{bar}] {pct}%\nstatus={selected.status}\n{selected.latest_log}"
 
 
-def render_progress_blocks(views: list[TaskView], max_blocks: int = 4) -> str:
+def render_progress_blocks(views: list[PromptView], max_blocks: int = 4) -> str:
     active = [v for v in views if v.status in {"running", "pending", "paused", "failed"}]
     if not active:
         if not views:
@@ -167,7 +218,7 @@ def render_progress_blocks(views: list[TaskView], max_blocks: int = 4) -> str:
     return "\n\n".join(blocks)
 
 
-def classify_task_highlight(view: TaskView) -> TaskHighlight:
+def classify_task_highlight(view: PromptView) -> TaskHighlight:
     if view.status == "failed":
         return "failed"
     if view.status == "paused":

@@ -11,7 +11,7 @@ from typing import Any
 from agent_instance import AgentInstance
 from id_refs import generate_short_ref
 from llm_client import LLMClient
-from task import Task
+from task import Prompt
 from tools import ToolRegistry
 
 
@@ -21,8 +21,13 @@ class Scheduler:
         self._max_in_flight = max_in_flight
 
         self._pending_queue: asyncio.Queue[str] = asyncio.Queue()
-        self._tasks: dict[str, Task] = {}
+        self._prompts: dict[str, Prompt] = {}
         self._task_tools: dict[str, dict[str, Any]] = {}
+        self._task_to_session: dict[str, str] = {}
+        self._session_tasks: dict[str, set[str]] = {}
+        self._session_root_task: dict[str, str] = {}
+        self._session_refs: dict[str, str] = {}
+        self._session_preflight_resources: dict[str, set[str]] = {}
         self._running: dict[str, asyncio.Task[None]] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
         self._pause_events: dict[str, asyncio.Event] = {}
@@ -36,12 +41,89 @@ class Scheduler:
         self._debug_enabled = os.getenv("PARAGENTS_TUI_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
 
     @property
-    def tasks(self) -> dict[str, Task]:
-        return self._tasks
+    def prompts(self) -> dict[str, Prompt]:
+        return self._prompts
 
     def set_llm_client(self, llm_client: LLMClient) -> None:
         # 仅影响新启动的任务；已在运行中的任务保持原客户端
         self._llm_client = llm_client
+
+    def get_prompt_session_id(self, prompt_id: str) -> str | None:
+        return self._task_to_session.get(prompt_id)
+
+    def list_sessions(self, active_only: bool = False) -> list[str]:
+        session_ids = list(self._session_tasks.keys())
+        if not active_only:
+            return session_ids
+        active: list[str] = []
+        for session_id in session_ids:
+            task_ids = self._session_tasks.get(session_id, set())
+            if not task_ids:
+                continue
+            for task_id in task_ids:
+                prompt = self._prompts.get(task_id)
+                if prompt is not None and prompt.status in {"pending", "running", "paused"}:
+                    active.append(session_id)
+                    break
+        return active
+
+    def get_session_task_ids(self, session_id: str) -> list[str]:
+        return sorted(self._session_tasks.get(session_id, set()))
+
+    def get_session_ref(self, session_id: str) -> str:
+        return self._session_refs.get(session_id, session_id[:6])
+
+    def get_session_active_task_id(self, session_id: str) -> str | None:
+        task_ids = self._session_tasks.get(session_id, set())
+        if not task_ids:
+            return None
+        prioritized = ["running", "paused", "pending", "failed", "completed", "cancelled"]
+        for status in prioritized:
+            candidates = [
+                self._prompts[task_id]
+                for task_id in task_ids
+                if task_id in self._prompts and self._prompts[task_id].status == status
+            ]
+            if candidates:
+                candidates.sort(key=lambda t: t.updated_at, reverse=True)
+                return candidates[0].prompt_id
+        return None
+
+    def _resolve_session_id(self, session_id: str | None, task_id: str) -> str:
+        if session_id:
+            return session_id
+        return task_id
+
+    def _assign_session_ref(self, session_id: str) -> str:
+        if session_id in self._session_refs:
+            return self._session_refs[session_id]
+        existing_refs = set(self._session_refs.values())
+        session_ref = generate_short_ref(existing_refs, length=6)
+        self._session_refs[session_id] = session_ref
+        return session_ref
+
+    def _extract_resource_keys(self, text: str) -> set[str]:
+        lowered = text.lower()
+        keys: set[str] = set()
+        for match in set(Path(part).name for part in text.split() if "." in part and "/" not in part):
+            if match:
+                keys.add(f"file:{match}")
+        if "git push" in lowered:
+            keys.add("git:push")
+        if "git commit" in lowered:
+            keys.add("git:commit")
+        return keys
+
+    def _preflight_conflicts(self, session_id: str, resource_keys: set[str]) -> list[str]:
+        if not resource_keys:
+            return []
+        conflicts: list[str] = []
+        for other_session, other_keys in self._session_preflight_resources.items():
+            if other_session == session_id:
+                continue
+            if resource_keys.intersection(other_keys):
+                conflicts.append(other_session)
+        return conflicts
 
     async def schedule_task_in(self, delay_s: float, user_input: str, tools: dict[str, Any]) -> str:
         scheduled_id = str(uuid.uuid4())
@@ -72,8 +154,8 @@ class Scheduler:
             await handle
         return True
 
-    def get_task_logs(self, task_id: str, limit: int = 200) -> list[str]:
-        logs = self._task_logs.get(task_id, [])
+    def get_prompt_logs(self, prompt_id: str, limit: int = 200) -> list[str]:
+        logs = self._task_logs.get(prompt_id, [])
         return logs[-limit:]
 
     def subscribe_task_logs(self, task_id: str) -> asyncio.Queue[str]:
@@ -102,109 +184,118 @@ class Scheduler:
         self,
         user_input: str,
         tools: dict[str, Any],
-        parent_task_id: str | None = None,
-        lineage_root_id: str | None = None,
+        session_id: str | None = None,
     ) -> str:
         task_id = str(uuid.uuid4())
-        existing_refs = {t.task_ref for t in self._tasks.values()}
-        task_ref = generate_short_ref(existing_refs, length=6)
-        run_dir = self._runs_root / task_ref
+        session_id = self._resolve_session_id(session_id, task_id)
+        session_ref = self._assign_session_ref(session_id)
+        existing_refs = {p.prompt_ref for p in self._prompts.values()}
+        prompt_ref = generate_short_ref(existing_refs, length=6)
+        run_dir = self._runs_root / prompt_ref
         run_dir.mkdir(parents=True, exist_ok=True)
-        task = Task(
-            task_id=task_id,
+        prompt = Prompt(
+            prompt_id=task_id,
             input=user_input,
-            task_ref=task_ref,
-            parent_task_id=parent_task_id,
-            lineage_root_id=lineage_root_id or parent_task_id or task_id,
+            prompt_ref=prompt_ref,
+            session_id=session_id,
             run_dir=str(run_dir),
             status="pending",
         )
-        task.local_state = {
-            **task.local_state,
-            "run_dir": task.run_dir,
-            "parent_task_id": task.parent_task_id,
-            "lineage_root_id": task.lineage_root_id,
+        preflight_keys = self._extract_resource_keys(user_input)
+        conflict_sessions = self._preflight_conflicts(session_id, preflight_keys)
+        prompt.local_state = {
+            **prompt.local_state,
+            "run_dir": prompt.run_dir,
+            "session_id": session_id,
+            "session_ref": session_ref,
+            "preflight_resource_keys": sorted(preflight_keys),
+            "preflight_conflict_with_sessions": conflict_sessions,
+            "preflight_decision": "serialize" if conflict_sessions else "allow",
         }
-        task.local_state.setdefault("initial_input", user_input)
-        self._tasks[task_id] = task
+        prompt.local_state.setdefault("initial_input", user_input)
+        self._prompts[task_id] = prompt
         self._task_tools[task_id] = tools
+        self._task_to_session[task_id] = session_id
+        self._session_tasks.setdefault(session_id, set()).add(task_id)
+        self._session_root_task.setdefault(session_id, task_id)
+        self._session_preflight_resources.setdefault(session_id, set()).update(preflight_keys)
         self._publish_log(task_id, "submitted")
         await self._pending_queue.put(task_id)
         return task_id
 
     async def continue_task(self, task_id: str, user_input: str) -> bool:
-        task = self._tasks.get(task_id)
-        if task is None:
+        prompt = self._prompts.get(task_id)
+        if prompt is None:
             return False
-        if task.status in {"running", "pending", "paused"}:
+        if prompt.status in {"running", "pending", "paused"}:
             return False
-        task.local_state.setdefault("initial_input", task.input)
-        task.input = user_input
-        task.result = None
-        task.error = None
-        task.status = "pending"
-        task.touch()
+        prompt.local_state.setdefault("initial_input", prompt.input)
+        prompt.input = user_input
+        prompt.result = None
+        prompt.error = None
+        prompt.status = "pending"
+        prompt.touch()
         if self._debug_enabled:
             self._publish_log(task_id, f"continued: {user_input}")
         await self._pending_queue.put(task_id)
         return True
 
     async def cancel(self, task_id: str) -> None:
-        task = self._tasks.get(task_id)
-        if task is None:
+        prompt = self._prompts.get(task_id)
+        if prompt is None:
             return
-        task.status = "cancelled"
-        task.touch()
+        prompt.status = "cancelled"
+        prompt.touch()
         self._publish_log(task_id, "cancel requested")
         if task_id in self._cancel_events:
             self._cancel_events[task_id].set()
 
     async def pause(self, task_id: str) -> None:
-        task = self._tasks.get(task_id)
-        if task is None or task.status != "running":
+        prompt = self._prompts.get(task_id)
+        if prompt is None or prompt.status != "running":
             return
-        task.status = "paused"
-        task.touch()
+        prompt.status = "paused"
+        prompt.touch()
         self._publish_log(task_id, "paused")
         event = self._pause_events.get(task_id)
         if event is not None:
             event.set()
 
     async def resume(self, task_id: str) -> None:
-        task = self._tasks.get(task_id)
-        if task is None or task.status != "paused":
+        prompt = self._prompts.get(task_id)
+        if prompt is None or prompt.status != "paused":
             return
         # 如果任务还在运行协程中（普通 pause），直接清 pause_event；
         # 如果已退出协程（例如等待审批），则重新入队。
         if task_id in self._running:
-            task.status = "running"
-            task.touch()
+            prompt.status = "running"
+            prompt.touch()
             self._publish_log(task_id, "resumed")
             event = self._pause_events.get(task_id)
             if event is not None:
                 event.clear()
             return
 
-        task.status = "pending"
-        task.touch()
+        prompt.status = "pending"
+        prompt.touch()
         self._publish_log(task_id, "approval granted, re-queued")
         await self._pending_queue.put(task_id)
 
     async def retry(self, task_id: str) -> None:
-        task = self._tasks.get(task_id)
-        if task is None:
+        prompt = self._prompts.get(task_id)
+        if prompt is None:
             return
-        if task.status not in ("failed", "cancelled"):
+        if prompt.status not in ("failed", "cancelled"):
             return
-        if task.retries >= task.max_retries:
+        if prompt.retries >= prompt.max_retries:
             return
 
-        task.retries += 1
-        task.status = "pending"
-        task.error = None
-        task.result = None
-        task.touch()
-        self._publish_log(task_id, f"retry queued ({task.retries}/{task.max_retries})")
+        prompt.retries += 1
+        prompt.status = "pending"
+        prompt.error = None
+        prompt.result = None
+        prompt.touch()
+        self._publish_log(task_id, f"retry queued ({prompt.retries}/{prompt.max_retries})")
         await self._pending_queue.put(task_id)
 
     async def _dispatch_loop(self) -> None:
@@ -214,15 +305,32 @@ class Scheduler:
                 continue
 
             task_id = await self._pending_queue.get()
-            task = self._tasks.get(task_id)
-            if task is None:
+            prompt = self._prompts.get(task_id)
+            if prompt is None:
                 continue
 
-            if task.status in ("completed", "cancelled", "running"):
+            if prompt.status in ("completed", "cancelled", "running"):
                 continue
 
-            task.status = "running"
-            task.touch()
+            session_id = self._task_to_session.get(task_id)
+            blockers = set(prompt.local_state.get("preflight_conflict_with_sessions", []))
+            if session_id and blockers:
+                blocking = False
+                for other_task_id, other_task in self._prompts.items():
+                    other_session_id = self._task_to_session.get(other_task_id)
+                    if (
+                        other_session_id in blockers
+                        and other_task.status in {"pending", "running", "paused"}
+                    ):
+                        blocking = True
+                        break
+                if blocking:
+                    await self._pending_queue.put(task_id)
+                    await asyncio.sleep(0.05)
+                    continue
+
+            prompt.status = "running"
+            prompt.touch()
             self._publish_log(task_id, "started")
 
             cancel_event = asyncio.Event()
@@ -231,35 +339,35 @@ class Scheduler:
             self._pause_events[task_id] = pause_event
 
             raw_tools = self._task_tools.get(task_id, {})
-            run_dir = task.run_dir
-            lineage_root_id = task.lineage_root_id
+            run_dir = prompt.run_dir
+            session_id = prompt.session_id
             bound_tools: dict[str, Any] = {}
             for name, tool in raw_tools.items():
                 async def _bound(
                     args: dict[str, Any],
                     tool=tool,
-                    _task_id=task_id,
+                    _prompt_id=task_id,
                     _run_dir=run_dir,
-                    _lineage_root_id=lineage_root_id,
+                    _session_id=session_id,
                 ) -> dict[str, Any]:
                     merged = dict(args)
-                    merged.setdefault("_task_id", _task_id)
+                    merged.setdefault("_prompt_id", _prompt_id)
+                    if _session_id:
+                        merged.setdefault("_session_id", _session_id)
                     if _run_dir:
-                        merged.setdefault("_task_run_dir", _run_dir)
-                    if _lineage_root_id:
-                        merged.setdefault("_lineage_root_id", _lineage_root_id)
+                        merged.setdefault("_prompt_run_dir", _run_dir)
                     return await tool(merged)
 
                 bound_tools[name] = _bound
             tools = ToolRegistry(bound_tools)
             if self._llm_client is None:
-                task.status = "failed"
-                task.error = "llm client is unavailable"
+                prompt.status = "failed"
+                prompt.error = "llm client is unavailable"
                 self._publish_log(task_id, "failed: llm client is unavailable")
                 continue
 
             agent = AgentInstance(
-                task=task,
+                task=prompt,
                 llm_client=self._llm_client,
                 tools=tools,
                 event_callback=lambda msg, tid=task_id: self._publish_log(tid, msg),
@@ -267,23 +375,23 @@ class Scheduler:
             self._running[task_id] = asyncio.create_task(self._run_agent(task_id, agent))
 
     async def _run_agent(self, task_id: str, agent: AgentInstance) -> None:
-        task = self._tasks[task_id]
+        prompt = self._prompts[task_id]
         cancel_event = self._cancel_events[task_id]
         pause_event = self._pause_events[task_id]
         try:
             await agent.run(cancel_event=cancel_event, pause_event=pause_event)
-            if task.status == "completed":
-                result_text = "" if task.result is None else str(task.result)
+            if prompt.status == "completed":
+                result_text = "" if prompt.result is None else str(prompt.result)
                 if result_text:
                     preview = result_text if len(result_text) <= 4000 else f"{result_text[:4000]}...<truncated>"
                     self._publish_log(task_id, f"result: {preview}")
                 self._publish_log(task_id, "finished successfully")
-            elif task.status == "cancelled":
+            elif prompt.status == "cancelled":
                 self._publish_log(task_id, "finished with cancellation")
         except Exception as exc:  # noqa: BLE001
-            task.status = "failed"
-            task.error = str(exc)
-            task.touch()
+            prompt.status = "failed"
+            prompt.error = str(exc)
+            prompt.touch()
             self._publish_log(task_id, f"failed: {exc}")
         finally:
             self._running.pop(task_id, None)

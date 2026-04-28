@@ -1,15 +1,25 @@
 from __future__ import annotations
 
-from task import Task
-from tui_state import TaskView, build_task_views, classify_task_highlight, render_progress_blocks, summarize_runtime
+from task import Prompt
+def Task(**kwargs):  # type: ignore[misc]
+    if "task_id" in kwargs:
+        kwargs["prompt_id"] = kwargs.pop("task_id")
+    if "task_ref" in kwargs:
+        kwargs["prompt_ref"] = kwargs.pop("task_ref")
+    p = Prompt(**kwargs)
+    p.task_id = p.prompt_id  # type: ignore[attr-defined]
+    p.task_ref = p.prompt_ref  # type: ignore[attr-defined]
+    return p
+
+from tui_state import PromptView, build_prompt_views, classify_task_highlight, render_progress_blocks, summarize_runtime
 
 
-def test_build_task_views_sorted_by_updated_desc() -> None:
+def test_build_prompt_views_sorted_by_updated_desc() -> None:
     t1 = Task(task_id="a", input="x", status="running")
     t2 = Task(task_id="b", input="y", status="paused")
     t1.updated_at = 10
     t2.updated_at = 20
-    views = build_task_views({"a": t1, "b": t2}, logs_by_task={"a": ["l1"], "b": ["l2", "l3"]})
+    views = build_prompt_views({"a": t1, "b": t2}, logs_by_task={"a": ["l1"], "b": ["l2", "l3"]})
     assert [v.task_id for v in views] == ["b", "a"]
     assert views[0].latest_log == "l3"
 
@@ -28,7 +38,7 @@ def test_summarize_runtime_counts() -> None:
 
 def test_render_progress_blocks_for_multiple_active_tasks() -> None:
     views = [
-        TaskView(
+        PromptView(
             task_id="aaaaaa11",
             task_ref="aaaaaa",
             status="running",
@@ -38,7 +48,7 @@ def test_render_progress_blocks_for_multiple_active_tasks() -> None:
             key_logs=["step=1"],
             pending_approval_request_id="",
         ),
-        TaskView(
+        PromptView(
             task_id="bbbbbb22",
             task_ref="bbbbbb",
             status="paused",
@@ -48,7 +58,7 @@ def test_render_progress_blocks_for_multiple_active_tasks() -> None:
             key_logs=["waiting"],
             pending_approval_request_id="req-1",
         ),
-        TaskView(
+        PromptView(
             task_id="cccccc33",
             task_ref="cccccc",
             status="pending",
@@ -67,10 +77,10 @@ def test_render_progress_blocks_for_multiple_active_tasks() -> None:
 
 
 def test_classify_task_highlight_variants() -> None:
-    approval_paused = TaskView("t1", "t1", "paused", 0, 1, "", [""], "req-1")
-    normal_paused = TaskView("t2", "t2", "paused", 0, 1, "", [""], "")
-    failed = TaskView("t3", "t3", "failed", 0, 1, "", [""], "")
-    running = TaskView("t4", "t4", "running", 0, 1, "", [""], "")
+    approval_paused = PromptView("t1", "t1", "paused", 0, 1, "", [""], "req-1")
+    normal_paused = PromptView("t2", "t2", "paused", 0, 1, "", [""], "")
+    failed = PromptView("t3", "t3", "failed", 0, 1, "", [""], "")
+    running = PromptView("t4", "t4", "running", 0, 1, "", [""], "")
     assert classify_task_highlight(approval_paused) == "approval_pause"
     assert classify_task_highlight(normal_paused) == "paused"
     assert classify_task_highlight(failed) == "failed"

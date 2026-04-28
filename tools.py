@@ -14,7 +14,7 @@ from mcp_runtime import MCPRegistry
 from permissions import PermissionManager
 
 ToolFunc = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
-SubmitSubagentFunc = Callable[[str, dict[str, ToolFunc], str | None, str | None], Awaitable[str]]
+SubmitSubagentFunc = Callable[[str, dict[str, ToolFunc], str | None], Awaitable[str]]
 ScheduleFunc = Callable[[float, str, dict[str, ToolFunc]], Awaitable[str]]
 CancelScheduledFunc = Callable[[str], Awaitable[bool]]
 ListScheduledFunc = Callable[[], dict[str, float]]
@@ -29,6 +29,7 @@ def _approval_meta(permission_manager: PermissionManager, request_id: str | None
     return {
         "approval_type": req.request_type,
         "approval_payload": dict(req.payload),
+        "owner_session_id": req.owner_session_id,
     }
 
 
@@ -156,23 +157,23 @@ def _build_spawn_tool(permission_manager: PermissionManager, submit_subagent: Su
         input_text = str(args.get("input", "")).strip()
         if not input_text:
             return {"ok": False, "error": "Missing input"}
-        parent_task_id = str(args.get("_task_id", "")).strip() or None
-        lineage_root_id = str(args.get("_lineage_root_id", "")).strip() or parent_task_id
+        session_id = str(args.get("_session_id", "")).strip() or None
         sub_tools = create_subagent_tools(permission_manager)
         try:
-            task_id = await submit_subagent(input_text, sub_tools, parent_task_id, lineage_root_id)
+            prompt_id = await submit_subagent(input_text, sub_tools, session_id)
         except TypeError:
             # 兼容旧签名 submit_subagent(input_text, tools)
-            task_id = await submit_subagent(input_text, sub_tools)  # type: ignore[misc]
-        return {"ok": True, "task_id": task_id}
+            prompt_id = await submit_subagent(input_text, sub_tools)  # type: ignore[misc]
+        return {"ok": True, "prompt_id": prompt_id}
 
     return _tool
 
 
 def _build_git_tool(permission_manager: PermissionManager, action: str) -> ToolFunc:
     async def _tool(args: dict[str, Any]) -> dict[str, Any]:
-        task_id = str(args.get("_task_id", "")).strip() or None
-        decision = permission_manager.check_git_action(action, task_id=task_id)
+        prompt_id = str(args.get("_prompt_id", "")).strip() or None
+        session_id = str(args.get("_session_id", "")).strip() or None
+        decision = permission_manager.check_git_action(action, prompt_id=prompt_id, session_id=session_id)
         if not decision.allowed:
             if decision.request_id:
                 return {
@@ -213,8 +214,9 @@ def _build_github_api_tool(permission_manager: PermissionManager) -> ToolFunc:
         path = str(args.get("path", "")).strip()
         if not path:
             return {"ok": False, "error": "Missing path"}
-        task_id = str(args.get("_task_id", "")).strip() or None
-        decision = permission_manager.check_github_request(method, path, task_id=task_id)
+        prompt_id = str(args.get("_prompt_id", "")).strip() or None
+        session_id = str(args.get("_session_id", "")).strip() or None
+        decision = permission_manager.check_github_request(method, path, prompt_id=prompt_id, session_id=session_id)
         if not decision.allowed:
             if decision.request_id:
                 return {
@@ -239,8 +241,8 @@ def _build_schedule_task_tool(schedule_task_in: ScheduleFunc | None) -> ToolFunc
         input_text = str(args.get("input", "")).strip()
         if not input_text:
             return {"ok": False, "error": "Missing input"}
-        task_id = await schedule_task_in(delay_s, input_text, {})
-        return {"ok": True, "scheduled_task_id": task_id}
+        prompt_id = await schedule_task_in(delay_s, input_text, {})
+        return {"ok": True, "scheduled_prompt_id": prompt_id}
 
     return _tool
 
@@ -258,17 +260,19 @@ def _build_cancel_scheduled_tool(cancel_scheduled_task: CancelScheduledFunc | No
     async def _tool(args: dict[str, Any]) -> dict[str, Any]:
         if cancel_scheduled_task is None:
             return {"ok": False, "error": "scheduler unavailable"}
-        task_id = str(args.get("task_id", "")).strip()
-        if not task_id:
-            return {"ok": False, "error": "Missing task_id"}
-        ok = await cancel_scheduled_task(task_id)
+        prompt_id = str(args.get("prompt_id", "")).strip()
+        if not prompt_id:
+            return {"ok": False, "error": "Missing prompt_id"}
+        ok = await cancel_scheduled_task(prompt_id)
         return {"ok": ok}
 
     return _tool
 
 
 async def read_file_tool(args: dict[str, Any], permission_manager: PermissionManager) -> dict[str, Any]:
-    cap_decision = permission_manager.check_capability_decision("filesystem")
+    prompt_id = str(args.get("_prompt_id", "")).strip() or None
+    session_id = str(args.get("_session_id", "")).strip() or None
+    cap_decision = permission_manager.check_capability_decision("filesystem", prompt_id=prompt_id, session_id=session_id)
     if not cap_decision.allowed:
         return {
             "ok": False,
@@ -316,7 +320,9 @@ async def read_file_tool(args: dict[str, Any], permission_manager: PermissionMan
 
 
 async def list_dir_tool(args: dict[str, Any], permission_manager: PermissionManager) -> dict[str, Any]:
-    cap_decision = permission_manager.check_capability_decision("filesystem")
+    prompt_id = str(args.get("_prompt_id", "")).strip() or None
+    session_id = str(args.get("_session_id", "")).strip() or None
+    cap_decision = permission_manager.check_capability_decision("filesystem", prompt_id=prompt_id, session_id=session_id)
     if not cap_decision.allowed:
         return {
             "ok": False,
@@ -360,7 +366,9 @@ async def list_dir_tool(args: dict[str, Any], permission_manager: PermissionMana
 
 
 async def glob_tool(args: dict[str, Any], permission_manager: PermissionManager) -> dict[str, Any]:
-    cap_decision = permission_manager.check_capability_decision("filesystem")
+    prompt_id = str(args.get("_prompt_id", "")).strip() or None
+    session_id = str(args.get("_session_id", "")).strip() or None
+    cap_decision = permission_manager.check_capability_decision("filesystem", prompt_id=prompt_id, session_id=session_id)
     if not cap_decision.allowed:
         return {
             "ok": False,
@@ -403,7 +411,9 @@ async def glob_tool(args: dict[str, Any], permission_manager: PermissionManager)
 
 
 async def grep_tool(args: dict[str, Any], permission_manager: PermissionManager) -> dict[str, Any]:
-    cap_decision = permission_manager.check_capability_decision("filesystem")
+    prompt_id = str(args.get("_prompt_id", "")).strip() or None
+    session_id = str(args.get("_session_id", "")).strip() or None
+    cap_decision = permission_manager.check_capability_decision("filesystem", prompt_id=prompt_id, session_id=session_id)
     if not cap_decision.allowed:
         return {
             "ok": False,
@@ -467,9 +477,10 @@ async def run_command_tool(args: dict[str, Any], permission_manager: PermissionM
     if tokens and tokens[0] in {"python", "python3"}:
         return await run_python_tool({"command": command, "timeout_s": args.get("timeout_s", 10)}, permission_manager)
 
-    task_id = str(args.get("_task_id", "")).strip() or None
-    run_dir = str(args.get("_task_run_dir", "")).strip()
-    cap_decision = permission_manager.check_capability_decision("shell", task_id=task_id)
+    prompt_id = str(args.get("_prompt_id", "")).strip() or None
+    session_id = str(args.get("_session_id", "")).strip() or None
+    run_dir = str(args.get("_prompt_run_dir", "")).strip()
+    cap_decision = permission_manager.check_capability_decision("shell", prompt_id=prompt_id, session_id=session_id)
     if not cap_decision.allowed:
         return {
             "ok": False,
@@ -479,7 +490,7 @@ async def run_command_tool(args: dict[str, Any], permission_manager: PermissionM
             **_approval_meta(permission_manager, cap_decision.request_id),
         }
 
-    decision = permission_manager.check_shell_command(command, task_id=task_id)
+    decision = permission_manager.check_shell_command(command, prompt_id=prompt_id, session_id=session_id)
     if not decision.allowed:
         if decision.request_id:
             return {
@@ -533,9 +544,10 @@ async def run_python_tool(args: dict[str, Any], permission_manager: PermissionMa
             safe_args = []
         command = " ".join([py, script, *safe_args]).strip()
 
-    task_id = str(args.get("_task_id", "")).strip() or None
-    run_dir = str(args.get("_task_run_dir", "")).strip()
-    decision = permission_manager.check_python_command(command, task_id=task_id)
+    prompt_id = str(args.get("_prompt_id", "")).strip() or None
+    session_id = str(args.get("_session_id", "")).strip() or None
+    run_dir = str(args.get("_prompt_run_dir", "")).strip()
+    decision = permission_manager.check_python_command(command, prompt_id=prompt_id, session_id=session_id)
     if not decision.allowed:
         if decision.request_id:
             return {

@@ -6,14 +6,14 @@ from typing import Any
 
 from llm_client import LLMClient
 from memory import LocalMemory
-from task import Task
+from task import Prompt
 from tools import ToolRegistry
 
 
 class AgentInstance:
     def __init__(
         self,
-        task: Task,
+        task: Prompt,
         llm_client: LLMClient,
         tools: ToolRegistry,
         event_callback: Callable[[str], None] | None = None,

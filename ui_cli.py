@@ -5,7 +5,7 @@ import shutil
 import time
 from typing import Any
 
-from task import Task
+from task import Prompt
 
 RESET = "\x1b[0m"
 BOLD = "\x1b[1m"
@@ -61,8 +61,8 @@ def format_startup_banner(provider: str, model: str, mode: str) -> str:
     return render_home_screen(provider=provider, model=model, mode=mode)
 
 
-def format_status_line(in_flight: int, pending_approvals: int, watching_task_id: str | None) -> str:
-    watch = watching_task_id[:6] if watching_task_id else "-"
+def format_status_line(in_flight: int, pending_approvals: int, watching_prompt_id: str | None) -> str:
+    watch = watching_prompt_id[:6] if watching_prompt_id else "-"
     now = time.strftime("%H:%M:%S")
     return (
         f"{BG_DARK}{BOLD} {now} {RESET} "
@@ -72,14 +72,14 @@ def format_status_line(in_flight: int, pending_approvals: int, watching_task_id:
     )
 
 
-def format_task_table(tasks: dict[str, Task]) -> str:
+def format_task_table(tasks: dict[str, Prompt]) -> str:
     headers = ("TASK_ID", "STATUS", "RETRIES", "RESULT")
     rows: list[tuple[str, str, str, str]] = []
     for task in tasks.values():
         result_preview = "" if task.result is None else str(task.result)
         if len(result_preview) > 24:
             result_preview = result_preview[:24] + "..."
-        rows.append((task.task_ref, task.status, str(task.retries), result_preview))
+        rows.append((task.prompt_ref, task.status, str(task.retries), result_preview))
     all_rows = [headers, *rows]
     widths = [max(len(r[i]) for r in all_rows) for i in range(4)]
     lines = [

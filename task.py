@@ -6,7 +6,7 @@ from typing import Any, Literal, Optional
 
 from id_refs import default_short_ref
 
-TaskStatus = Literal[
+PromptStatus = Literal[
     "pending",
     "running",
     "paused",
@@ -17,14 +17,13 @@ TaskStatus = Literal[
 
 
 @dataclass
-class Task:
-    task_id: str
+class Prompt:
+    prompt_id: str
     input: str
-    task_ref: str = ""
-    parent_task_id: str | None = None
-    lineage_root_id: str | None = None
+    prompt_ref: str = ""
+    session_id: str | None = None
     run_dir: str = ""
-    status: TaskStatus = "pending"
+    status: PromptStatus = "pending"
     result: Optional[Any] = None
     error: Optional[str] = None
     local_state: dict[str, Any] = field(default_factory=dict)
@@ -37,7 +36,7 @@ class Task:
         self.updated_at = time.time()
 
     def __post_init__(self) -> None:
-        if not self.task_ref:
-            self.task_ref = default_short_ref(self.task_id, length=6)
-        if self.lineage_root_id is None:
-            self.lineage_root_id = self.parent_task_id or self.task_id
+        if not self.prompt_ref:
+            self.prompt_ref = default_short_ref(self.prompt_id, length=6)
+        if self.session_id is None:
+            self.session_id = self.prompt_id

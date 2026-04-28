@@ -2,17 +2,42 @@ from __future__ import annotations
 
 import asyncio
 
-from task import Task
+from task import Prompt
+def Task(**kwargs):  # type: ignore[misc]
+    if "task_id" in kwargs:
+        kwargs["prompt_id"] = kwargs.pop("task_id")
+    if "task_ref" in kwargs:
+        kwargs["prompt_ref"] = kwargs.pop("task_ref")
+    p = Prompt(**kwargs)
+    p.task_id = p.prompt_id  # type: ignore[attr-defined]
+    p.task_ref = p.prompt_ref  # type: ignore[attr-defined]
+    return p
+
 from tui_app import ParagentsTUI, build_tui_layout
 
 
 class _FakeScheduler:
     def __init__(self) -> None:
-        self.tasks: dict[str, object] = {}
+        self.prompts: dict[str, object] = {}
         self.logs_by_task: dict[str, list[str]] = {}
 
-    def get_task_logs(self, task_id: str, limit: int = 200) -> list[str]:
+    @property
+    def tasks(self) -> dict[str, object]:
+        return self.prompts
+
+    @tasks.setter
+    def tasks(self, value: dict[str, object]) -> None:
+        self.prompts = value
+
+    def get_prompt_logs(self, task_id: str, limit: int = 200) -> list[str]:
         return self.logs_by_task.get(task_id, [])[-limit:]
+
+    def get_task_logs(self, task_id: str, limit: int = 200) -> list[str]:
+        return self.get_prompt_logs(task_id, limit=limit)
+
+    def get_prompt_session_id(self, prompt_id: str) -> str | None:
+        prompt = self.prompts.get(prompt_id)
+        return str(getattr(prompt, "session_id", "")).strip() or None
 
 
 def test_build_tui_layout_has_required_regions() -> None:
@@ -210,7 +235,7 @@ def test_approval_detail_line_is_before_confirm_prompt() -> None:
     assert detail_idx < prompt_idx
 
 
-def test_finish_prefix_auto_popup_and_enter_fill_only() -> None:
+def test_close_prefix_auto_popup_and_enter_fill_only() -> None:
     async def _handler(_: str) -> list[str]:
         return []
 
@@ -225,13 +250,13 @@ def test_finish_prefix_auto_popup_and_enter_fill_only() -> None:
         finish_candidate_task_ids_provider=lambda: [task.task_id],
     )
     tui.show_welcome = False
-    tui.input_buffer.text = "/finish"
+    tui.input_buffer.text = "/close"
     tui._refresh_context_popup()
-    assert tui.context_popup_mode == "finish"
-    assert tui.context_candidates[0][0] == "aa11bb"
+    assert tui.context_popup_mode == "close"
+    assert tui.context_candidates[0][0] == "aaaaaa"
 
     tui._apply_context_selection()
-    assert tui.input_buffer.text == "/finish aa11bb"
+    assert tui.input_buffer.text == "/close aaaaaa"
     assert tui.context_popup_mode is None
 
 
@@ -252,10 +277,10 @@ def test_show_prefix_popup_contains_running_and_unacked_completed() -> None:
         show_candidate_task_ids_provider=lambda: [running.task_id, unacked_done.task_id],
     )
     tui.show_welcome = False
-    tui.input_buffer.text = "/show"
+    tui.input_buffer.text = "/switch"
     tui._refresh_context_popup()
-    assert tui.context_popup_mode == "show"
-    assert {token for token, _ in tui.context_candidates} == {"bb22cc", "cc33dd"}
+    assert tui.context_popup_mode == "switch"
+    assert {token for token, _ in tui.context_candidates} == {"bbbbbb", "cccccc"}
 
 
 def test_context_popup_height_matches_candidates() -> None:
@@ -275,7 +300,7 @@ def test_context_popup_height_matches_candidates() -> None:
         show_candidate_task_ids_provider=lambda: [t1.task_id, t2.task_id],
     )
     tui.show_welcome = False
-    tui.input_buffer.text = "/show"
+    tui.input_buffer.text = "/switch"
     tui._refresh_context_popup()
     _ = tui._popup_text()
     assert tui.parts.popup_float.height == 6
@@ -503,7 +528,7 @@ def test_submit_request_stops_blinking_after_request_no_longer_pending() -> None
     assert not any(style == "class:status.approval" and "request_id=" in text for style, text in frags)
 
 
-def test_welcome_text_mentions_5_slots_and_finish() -> None:
+def test_welcome_text_mentions_5_slots_and_close() -> None:
     async def _handler(_: str) -> list[str]:
         return []
 
@@ -514,7 +539,7 @@ def test_welcome_text_mentions_5_slots_and_finish() -> None:
     )
     text = tui._welcome_text()
     assert "<= 5" in text
-    assert "/finish" in text
+    assert "/close" in text
 
 
 def test_submit_panels_exclude_current_watch_task() -> None:
@@ -850,3 +875,48 @@ def test_provider_driven_show_hide_roundtrip_updates_submit_panels() -> None:
     ui_state["submit_slot_ids"] = [task_a.task_id, task_b.task_id]
     after = [v.task_id for v in tui._submit_task_views()]
     assert set(after) == {task_a.task_id, task_b.task_id}
+
+
+def test_session_history_records_natural_language_as_run_for_foreground_session() -> None:
+    async def _handler(_: str) -> list[str]:
+        return []
+
+    scheduler = _FakeScheduler()
+    task = Task(task_id="sess11111111", input="x", status="running")
+    task.session_id = "session-abc"
+    scheduler.tasks = {task.task_id: task}
+    tui = ParagentsTUI(
+        scheduler=scheduler,  # type: ignore[arg-type]
+        pending_approvals_provider=lambda: 0,
+        command_handler=_handler,
+    )
+    tui.show_welcome = False
+    tui.foreground_task_id = task.task_id
+
+    tui._record_session_history_command("写一个 quick sort")
+
+    assert tui._session_command_history["session-abc"] == ["/run 写一个 quick sort"]
+
+
+def test_session_history_popup_returns_recorded_candidates() -> None:
+    async def _handler(_: str) -> list[str]:
+        return []
+
+    scheduler = _FakeScheduler()
+    task = Task(task_id="sess22222222", input="x", status="running")
+    task.session_id = "session-def"
+    scheduler.tasks = {task.task_id: task}
+    tui = ParagentsTUI(
+        scheduler=scheduler,  # type: ignore[arg-type]
+        pending_approvals_provider=lambda: 0,
+        command_handler=_handler,
+    )
+    tui.show_welcome = False
+    tui.foreground_task_id = task.task_id
+    tui._record_session_history_command("run hello world")
+
+    tui._show_session_run_history_popup()
+
+    assert tui.context_popup_mode == "session_run_history"
+    assert tui.context_candidates
+    assert tui.context_candidates[0][0] == "/run hello world"
