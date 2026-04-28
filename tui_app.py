@@ -4,6 +4,8 @@ import asyncio
 import contextlib
 from dataclasses import dataclass
 import hashlib
+import json
+import os
 import platform
 import re
 import time
@@ -24,7 +26,7 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 
 from scheduler import Scheduler
-from tui_state import build_task_views, normalize_tui_command
+from tui_state import build_prompt_views, build_session_views, normalize_tui_command
 
 
 @dataclass
@@ -52,7 +54,7 @@ def build_tui_layout(
     get_submit_count = submit_count_provider or (lambda: 0)
     log_panel = Window(
         FormattedTextControl("log_panel"),
-        wrap_lines=True,
+        wrap_lines=False,
         width=Dimension(weight=7, min=72),
         style="class:panel.main",
     )
@@ -135,7 +137,8 @@ def build_tui_layout(
     popup_float = Float(
         content=ConditionalContainer(content=options_popup, filter=show_options_filter),
         left=4,
-        bottom=1,
+        # Dynamic bottom is adjusted at runtime in ParagentsTUI._update_popup_position().
+        bottom=3,
         width=58,
         height=8,
         hide_when_covering_content=False,
@@ -167,6 +170,9 @@ class ParagentsTUI:
         command_handler: Callable[[str], Awaitable[list[str]]],
         foreground_task_id_provider: Callable[[], str | None] | None = None,
         task_slot_ids_provider: Callable[[], list[str]] | None = None,
+        session_slot_ids_provider: Callable[[], list[str]] | None = None,
+        session_ref_resolver: Callable[[str], str] | None = None,
+        session_active_task_resolver: Callable[[str], str | None] | None = None,
         finish_candidate_task_ids_provider: Callable[[], list[str]] | None = None,
         watching_task_id_provider: Callable[[], str | None] | None = None,
         submit_slot_ids_provider: Callable[[], list[str]] | None = None,
@@ -181,6 +187,9 @@ class ParagentsTUI:
         self.command_handler = command_handler
         self.foreground_task_id_provider = foreground_task_id_provider or watching_task_id_provider
         self.task_slot_ids_provider = task_slot_ids_provider or submit_slot_ids_provider
+        self.session_slot_ids_provider = session_slot_ids_provider
+        self.session_ref_resolver = session_ref_resolver
+        self.session_active_task_resolver = session_active_task_resolver
         self.finish_candidate_task_ids_provider = finish_candidate_task_ids_provider or ack_pending_task_ids_provider
         self.show_candidate_task_ids_provider = show_candidate_task_ids_provider
         self.approve_candidate_request_refs_provider = approve_candidate_request_refs_provider
@@ -241,23 +250,25 @@ class ParagentsTUI:
         self.context_popup_mode: str | None = None  # slash | finish | show | approve | deny | None
         self.context_candidates: list[tuple[str, str]] = []
         self.context_selected = 0
+        self._session_command_history: dict[str, list[str]] = {}
         self.option_items: list[tuple[str, str]] = [
             ("/new <task>", "/new "),
             ("/run <task>", "/run "),
             ("/list", "/list"),
             ("/approvals", "/approvals"),
-            ("/show <task_id>", "/show "),
-            ("/log <task_id>", "/log "),
-            ("/finish <task_id>", "/finish "),
+            ("/show <session_id>", "/show "),
+            ("/log <session_id>", "/log "),
+            ("/finish <session_id>", "/finish "),
             ("/approve <id>", "/approve "),
             ("/deny <id>", "/deny "),
             ("/pause <task_id>", "/pause "),
-            ("/resume <task_id>", "/resume "),
+            ("/resume <session_id>", "/resume "),
             ("/cancel <task_id>", "/cancel "),
         ]
         self.option_selected = 0
         self.logs: list[str] = [self._format_par("ready")]
         self._seen_count_by_task: dict[str, int] = {}
+        self._watch_tail_by_task: dict[str, list[str]] = {}
         self._watch_phase_by_task: dict[str, str] = {}
         self._pending_approval_by_task: dict[str, str] = {}
         self._side_log_task_id: str | None = None
@@ -275,6 +286,13 @@ class ParagentsTUI:
         self._watch_pump_task: asyncio.Task[None] | None = None
         self._max_main_log_lines = 4000
         self._system_notices: list[tuple[str, int]] = []
+        self._render_debug_enabled = os.getenv("PARAGENTS_TUI_RENDER_DEBUG", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._render_debug_tick = 0
         self.parts = build_tui_layout(
             show_options_filter=Condition(lambda: self.show_options or self.context_popup_mode is not None),
             submit_count_provider=lambda: len(self._submit_task_views()),
@@ -288,6 +306,23 @@ class ParagentsTUI:
             style=self._style(),
         )
         self.app.layout.focus(self.parts.command_bar)
+
+    def _trace_history_event(self, event: str, **payload: Any) -> None:
+        line = {
+            "ts_ms": int(time.time() * 1000),
+            "event": event,
+            "foreground_task_id": self.foreground_task_id or "",
+            "log_view_task_id": self.log_view_task_id or "",
+            **payload,
+        }
+        with contextlib.suppress(Exception):
+            with open(".paragents/tui_debug.log", "a", encoding="utf-8") as fp:
+                fp.write(json.dumps(line, ensure_ascii=False) + "\n")
+
+    def _trace_render_event(self, event: str, **payload: Any) -> None:
+        if not self._render_debug_enabled:
+            return
+        self._trace_history_event(event, **payload)
 
     @property
     def watching_task_id(self) -> str | None:
@@ -304,11 +339,12 @@ class ParagentsTUI:
                 self._pending_approval_by_task.pop(self.foreground_task_id, None)
             if current and current not in self._seen_count_by_task:
                 self._seen_count_by_task[current] = 0
+                self._watch_tail_by_task[current] = []
                 self._watch_phase_by_task[current] = "thinking..."
             self.foreground_task_id = current
             self._sync_main_panel_binding()
         if self.task_slot_ids_provider is not None:
-            next_slots = [tid for tid in self.task_slot_ids_provider() if tid in self.scheduler.tasks]
+            next_slots = [tid for tid in self.task_slot_ids_provider() if tid in self.scheduler.prompts]
             self._task_slot_ids = next_slots[:5]
 
     def _append_main_log(self, line: str) -> None:
@@ -317,6 +353,13 @@ class ParagentsTUI:
         if overflow > 0:
             del self.logs[:overflow]
         self._side_log_back_offset = 0
+        self._trace_render_event(
+            "RENDER_APPEND_MAIN_LOG",
+            logs_len=len(self.logs),
+            overflow=max(0, overflow),
+            side_log_back_offset=self._side_log_back_offset,
+            appended_preview=self._truncate_to_display_width(line.replace("\n", "\\n"), 120),
+        )
 
     def _extend_main_logs(self, lines: list[str]) -> None:
         for line in lines:
@@ -347,13 +390,14 @@ class ParagentsTUI:
         if target_task_id is None:
             return
         self._seen_count_by_task[target_task_id] = 0
+        self._watch_tail_by_task[target_task_id] = []
         self._append_watch_logs()
 
     def _task_ref(self, task_id: str) -> str:
-        task = self.scheduler.tasks.get(task_id)
+        task = self.scheduler.prompts.get(task_id)
         if task is None:
             return task_id[:6]
-        return str(getattr(task, "task_ref", task_id[:6]))
+        return str(getattr(task, "prompt_ref", task_id[:6]))
 
     def _request_ref(self, request_id: str) -> str:
         rid = request_id.strip()
@@ -396,8 +440,8 @@ class ParagentsTUI:
     def _scroll_hint_text(self) -> str:
         system = platform.system().lower()
         if system == "darwin":
-            return " Log Scroll: Fn+↑/Fn+↓ | line: Ctrl+K/Ctrl+J "
-        return " Log Scroll: PageUp/PageDown | line: Ctrl+K/Ctrl+J "
+            return " Log Scroll: Fn+↑/Fn+↓ | line: Ctrl+K/Ctrl+J | Input: Alt+Enter换行/Ctrl+U清空 | Ctrl+R会话指令 | Ctrl+X取消运行 "
+        return " Log Scroll: PageUp/PageDown | line: Ctrl+K/Ctrl+J | Input: Alt+Enter newline/Ctrl+U clear | Ctrl+R session cmds | Ctrl+X cancel "
 
     def _truncate_to_display_width(self, text: str, max_width: int) -> str:
         if max_width <= 0:
@@ -425,16 +469,34 @@ class ParagentsTUI:
         raw = self.input_buffer.text.strip()
         lower = raw.lower()
         mode: str | None = None
-        if re.fullmatch(r"/?finish(?:\s.*)?", lower):
+        if lower.startswith("/"):
+            command_head = lower.split(" ", 1)[0]
+            if command_head in {"/finish", "/show", "/approve", "/deny"}:
+                mode_map = {
+                    "/finish": "finish",
+                    "/show": "show",
+                    "/approve": "approve",
+                    "/deny": "deny",
+                }
+                mode = mode_map.get(command_head)
+            elif " " not in lower:
+                # If a slash command word is already complete, don't keep showing generic COMMAND popup.
+                if command_head in self._slash_commands:
+                    mode = None
+                else:
+                    mode = "slash"
+            elif command_head in self._slash_commands:
+                mode = None
+            else:
+                mode = "slash"
+        elif re.fullmatch(r"finish(?:\s.*)?", lower):
             mode = "finish"
-        elif re.fullmatch(r"/?show(?:\s.*)?", lower):
+        elif re.fullmatch(r"show(?:\s.*)?", lower):
             mode = "show"
-        elif re.fullmatch(r"/?approve(?:\s.*)?", lower):
+        elif re.fullmatch(r"approve(?:\s.*)?", lower):
             mode = "approve"
-        elif re.fullmatch(r"/?deny(?:\s.*)?", lower):
+        elif re.fullmatch(r"deny(?:\s.*)?", lower):
             mode = "deny"
-        elif raw.startswith("/") and " " not in raw:
-            mode = "slash"
         if mode is None:
             self.context_popup_mode = None
             self.context_candidates = []
@@ -448,6 +510,49 @@ class ParagentsTUI:
             return
         self.context_selected = max(0, min(self.context_selected, len(candidates) - 1))
 
+    def _estimate_wrapped_lines(self, text: str, width: int) -> int:
+        if width <= 0:
+            return 1
+        lines = text.splitlines() or [""]
+        total = 0
+        for line in lines:
+            line_width = max(1, get_cwidth(line))
+            total += max(1, (line_width + width - 1) // width)
+        return max(1, total)
+
+    def _command_bar_height(self) -> int:
+        try:
+            cols = int(self.app.output.get_size().columns)
+        except Exception:
+            cols = 120
+        # command_prefix has fixed width=5; reserve 1 char safety.
+        input_width = max(12, cols - 6)
+        text = self.input_buffer.text or ""
+        return min(20, self._estimate_wrapped_lines(text, input_width))
+
+    def _update_command_row_height(self) -> None:
+        target = self._command_bar_height()
+        fixed = Dimension(min=target, max=target)
+        # Keep command prefix and input buffer row aligned.
+        self.parts.command_prefix.height = fixed
+        self.parts.command_bar.height = fixed
+
+    def _update_popup_position(self) -> None:
+        # Layout rows below main area:
+        # 1) separator between main and hint (blue line target)
+        # 2) hint row
+        # 3) command row (dynamic)
+        # Keep popup bottom edge just above the separator line.
+        try:
+            cols = int(self.app.output.get_size().columns)
+        except Exception:
+            cols = 120
+        dynamic_bottom = 1 + self._command_bar_height()
+        self.parts.popup_float.bottom = max(1, dynamic_bottom)
+        # Keep popup away from main log text area to avoid masking long code outputs.
+        # popup_width = 58
+        # self.parts.popup_float.left = max(4, cols - popup_width - 2)
+
     def _context_candidate_ids(self, mode: str) -> list[tuple[str, str]]:
         if mode == "slash":
             prefix = self.input_buffer.text.strip().lower()
@@ -456,16 +561,35 @@ class ParagentsTUI:
             matched = [cmd for cmd in self._slash_commands if cmd.startswith(prefix)]
             return [(cmd, cmd) for cmd in matched]
         if mode == "finish":
+            if (
+                self.session_slot_ids_provider is not None
+                and self.session_ref_resolver is not None
+                and self.session_active_task_resolver is not None
+            ):
+                result: list[tuple[str, str]] = []
+                for session_id in self.session_slot_ids_provider():
+                    active_task_id = self.session_active_task_resolver(session_id)
+                    if not active_task_id:
+                        continue
+                    task = self.scheduler.prompts.get(active_task_id)
+                    if task is None:
+                        continue
+                    session_ref = self.session_ref_resolver(session_id)
+                    status = str(getattr(task, "status", ""))
+                    logs = self.scheduler.get_prompt_logs(active_task_id, limit=1)
+                    latest = self._compact_ids_in_text(logs[-1]) if logs else ""
+                    result.append((session_ref, f"{session_ref} [{status}] {latest}"))
+                return result
             provider = self.finish_candidate_task_ids_provider
             if provider is None:
                 return []
             result: list[tuple[str, str]] = []
             for task_id in provider():
-                task = self.scheduler.tasks.get(task_id)
+                task = self.scheduler.prompts.get(task_id)
                 if task is None:
                     continue
                 status = str(getattr(task, "status", ""))
-                logs = self.scheduler.get_task_logs(task_id, limit=1)
+                logs = self.scheduler.get_prompt_logs(task_id, limit=1)
                 latest = self._compact_ids_in_text(logs[-1]) if logs else ""
                 result.append((self._task_ref(task_id), f"{self._task_ref(task_id)} [{status}] {latest}"))
             return result
@@ -475,14 +599,22 @@ class ParagentsTUI:
                 return []
             result: list[tuple[str, str]] = []
             for task_id in provider():
-                task = self.scheduler.tasks.get(task_id)
+                task = self.scheduler.prompts.get(task_id)
                 if task is None:
                     continue
                 status = str(getattr(task, "status", ""))
-                logs = self.scheduler.get_task_logs(task_id, limit=1)
+                logs = self.scheduler.get_prompt_logs(task_id, limit=1)
                 latest = self._compact_ids_in_text(logs[-1]) if logs else ""
                 result.append((self._task_ref(task_id), f"{self._task_ref(task_id)} [{status}] {latest}"))
             return result
+        if mode == "session_run_history":
+            session_id = self._current_session_id()
+            if not session_id:
+                return []
+            commands = self._session_command_history.get(session_id, [])
+            if not commands:
+                return []
+            return [(command, command) for command in commands]
         request_provider = (
             self.approve_candidate_request_refs_provider
             if mode == "approve"
@@ -493,6 +625,8 @@ class ParagentsTUI:
         return [(request_ref, f"{request_ref} [pending approval]") for request_ref in request_provider()]
 
     def _popup_text(self) -> str:
+        self._update_command_row_height()
+        self._update_popup_position()
         if self.show_options:
             self.parts.popup_float.height = len(self.option_items) + 5
             return self._options_popup_text()
@@ -511,6 +645,7 @@ class ParagentsTUI:
             "show": " SHOW Candidates ",
             "approve": " APPROVE Candidates ",
             "deny": " DENY Candidates ",
+            "session_run_history": " SESSION /RUN History ",
         }
         title = title_map.get(mode, " Candidates ")
 
@@ -551,6 +686,7 @@ class ParagentsTUI:
             "show": "/show ",
             "approve": "/approve ",
             "deny": "/deny ",
+            "session_run_history": "",
         }
         prefix = prefix_map.get(self.context_popup_mode, "")
         self.input_buffer.text = prefix + token
@@ -567,14 +703,16 @@ class ParagentsTUI:
             rows = int(self.app.output.get_size().rows)
         except Exception:
             rows = default_rows
-        # Reserve rows for command bar/separators/spinner headroom.
-        return max(30, rows - 4)
+        # Reserve rows for: separator(main/hint) + hint row + dynamic command row
+        # + one extra breathing row so the main log viewport does not jump.
+        reserved_rows = 1 + 1 + self._command_bar_height() + 1
+        return max(30, rows - reserved_rows)
 
     def _main_panel_header_line(self) -> str | None:
         task_id = self.log_view_task_id or self.foreground_task_id
         if not task_id:
             return None
-        task = self.scheduler.tasks.get(task_id)
+        task = self.scheduler.prompts.get(task_id)
         if task is None:
             return None
         initial = str(getattr(task, "local_state", {}).get("initial_input", "")).strip()
@@ -594,8 +732,8 @@ class ParagentsTUI:
     def _main_panel_lines(self) -> list[str]:
         self._sync_main_panel_binding()
         lines = list(self.logs)
-        if self.foreground_task_id and self.foreground_task_id in self.scheduler.tasks:
-            task = self.scheduler.tasks[self.foreground_task_id]
+        if self.foreground_task_id and self.foreground_task_id in self.scheduler.prompts:
+            task = self.scheduler.prompts[self.foreground_task_id]
             task_status = getattr(task, "status", "")
             if task_status in {"running", "pending", "paused"}:
                 self._spinner_idx = (self._spinner_idx + 1) % len(self._spinner_frames)
@@ -621,35 +759,64 @@ class ParagentsTUI:
         width = self._main_panel_wrap_width()
         visual: list[str] = []
         for raw in lines:
-            line = raw or ""
-            if not line:
-                visual.append("")
-                continue
-            current: list[str] = []
-            current_w = 0
-            for ch in line:
-                ch_w = max(1, get_cwidth(ch))
-                if current and current_w + ch_w > width:
-                    visual.append("".join(current))
-                    current = [ch]
-                    current_w = ch_w
-                else:
-                    current.append(ch)
-                    current_w += ch_w
-            visual.append("".join(current))
+            # Keep the same line model as final rendering: split embedded newlines first,
+            # then wrap each logical line by display width.
+            logical_lines = (raw or "").splitlines() or [""]
+            for line in logical_lines:
+                if not line:
+                    visual.append("")
+                    continue
+                current: list[str] = []
+                current_w = 0
+                for ch in line:
+                    ch_w = max(1, get_cwidth(ch))
+                    if current and current_w + ch_w > width:
+                        visual.append("".join(current))
+                        current = [ch]
+                        current_w = ch_w
+                    else:
+                        current.append(ch)
+                        current_w += ch_w
+                visual.append("".join(current))
+        self._trace_render_event(
+            "RENDER_TO_VISUAL_LINES",
+            wrap_width=width,
+            logical_lines=len(lines),
+            visual_lines=len(visual),
+        )
         return visual
 
     def _slice_main_panel_lines(self, lines: list[str]) -> list[str]:
         line_limit = self._log_line_limit()
         visual_lines = self._to_visual_lines(lines)
         if not visual_lines:
+            self._trace_render_event(
+                "RENDER_SLICE_EMPTY",
+                line_limit=line_limit,
+                side_log_back_offset=self._side_log_back_offset,
+            )
             return []
         if len(visual_lines) <= line_limit:
+            self._trace_render_event(
+                "RENDER_SLICE_ALL",
+                line_limit=line_limit,
+                visual_count=len(visual_lines),
+                side_log_back_offset=self._side_log_back_offset,
+            )
             return visual_lines
         max_back = max(0, len(visual_lines) - line_limit)
         self._side_log_back_offset = max(0, min(self._side_log_back_offset, max_back))
         end = len(visual_lines) - self._side_log_back_offset
         start = max(0, end - line_limit)
+        self._trace_render_event(
+            "RENDER_SLICE_WINDOW",
+            line_limit=line_limit,
+            visual_count=len(visual_lines),
+            start=start,
+            end=end,
+            max_back=max_back,
+            side_log_back_offset=self._side_log_back_offset,
+        )
         return visual_lines[start:end]
 
     def _scroll_main_logs(self, delta_lines: int) -> None:
@@ -668,7 +835,143 @@ class ParagentsTUI:
         self.input_buffer.history_forward(count=1)
         self.input_buffer.cursor_position = len(self.input_buffer.text)
 
+    def _is_multiline_editing_active(self) -> bool:
+        text = self.input_buffer.text or ""
+        return "\n" in text or self._command_bar_height() > 1
+
+    def _current_session_id(self) -> str | None:
+        task_id = self.log_view_task_id or self.foreground_task_id
+        if not task_id:
+            self._trace_history_event("SESSION_RESOLVE_EMPTY_TASK")
+            return None
+        try:
+            session_id = self.scheduler.get_prompt_session_id(task_id)
+            if session_id:
+                self._trace_history_event("SESSION_RESOLVE_BY_SCHEDULER", task_id=task_id, session_id=session_id)
+                return session_id
+        except Exception:
+            pass
+        task = self.scheduler.prompts.get(task_id)
+        if task is None:
+            self._trace_history_event("SESSION_RESOLVE_TASK_MISSING", task_id=task_id)
+            return None
+        resolved = str(getattr(task, "session_id", "")).strip() or None
+        self._trace_history_event("SESSION_RESOLVE_BY_TASK", task_id=task_id, session_id=resolved or "")
+        return resolved
+
+    def _record_session_history_command(self, effective_cmd: str) -> None:
+        raw_effective = effective_cmd.strip()
+        canonical = raw_effective
+        known_prefixes = (
+            "new ",
+            "run ",
+            "submit ",
+            "list",
+            "show ",
+            "log ",
+            "finish ",
+            "approvals",
+            "approve ",
+            "deny ",
+            "pause ",
+            "resume ",
+            "cancel ",
+            "quit",
+            "exit",
+        )
+        if canonical and not canonical.startswith(known_prefixes) and canonical not in {"y", "n"}:
+            canonical = f"{'run' if self.foreground_task_id else 'new'} {canonical}"
+
+        session_id = self._current_session_id()
+        if not session_id:
+            self._trace_history_event("SESSION_HISTORY_SKIP_NO_SESSION", effective_cmd=raw_effective, canonical_cmd=canonical)
+            return
+        normalized = canonical
+        if not normalized:
+            self._trace_history_event("SESSION_HISTORY_SKIP_EMPTY", session_id=session_id)
+            return
+        if normalized in {"y", "n"}:
+            self._trace_history_event("SESSION_HISTORY_SKIP_REPLY", session_id=session_id, cmd=normalized)
+            return
+        if normalized.startswith(
+            (
+                "list",
+                "show ",
+                "log ",
+                "finish ",
+                "approvals",
+                "approve ",
+                "deny ",
+                "pause ",
+                "resume ",
+                "cancel ",
+                "quit",
+                "exit",
+                "submit ",
+            )
+        ):
+            self._trace_history_event("SESSION_HISTORY_SKIP_CONTROL", session_id=session_id, cmd=normalized)
+            return
+
+        current = list(self._session_command_history.get(session_id, []))
+
+        if not current and normalized.startswith(("new ", "run ")):
+            head, payload = normalized.split(" ", 1)
+            payload = payload.strip()
+            if payload:
+                current.append(f"/{head} {payload}")
+
+        if normalized.startswith("run "):
+            payload = normalized[len("run ") :].strip()
+            if payload:
+                run_cmd = f"/run {payload}"
+                if run_cmd not in current:
+                    current.append(run_cmd)
+
+        if not current:
+            self._trace_history_event("SESSION_HISTORY_SKIP_NO_MATCH", session_id=session_id, cmd=normalized)
+            return
+        self._session_command_history = {**self._session_command_history, session_id: current}
+        self._trace_history_event(
+            "SESSION_HISTORY_RECORDED",
+            session_id=session_id,
+            effective_cmd=raw_effective,
+            canonical_cmd=normalized,
+            history=current,
+        )
+
+    def _show_session_run_history_popup(self) -> None:
+        self._refresh_external_state()
+        candidates = self._context_candidate_ids("session_run_history")
+        self._trace_history_event(
+            "SESSION_HISTORY_POPUP",
+            session_id=self._current_session_id() or "",
+            candidate_count=len(candidates),
+            candidates=[token for token, _ in candidates],
+        )
+        self.show_options = False
+        self.context_popup_mode = "session_run_history"
+        self.context_candidates = candidates
+        self.context_selected = 0
+
+    def _cancel_active_prompt(self, event) -> None:  # noqa: ANN001
+        self._refresh_external_state()
+        prompt_id = self.foreground_task_id
+        if not prompt_id:
+            self._append_main_log(self._format_par("当前没有 foreground prompt，可取消操作已忽略。"))
+            self._request_redraw()
+            return
+        prompt = self.scheduler.prompts.get(prompt_id)
+        status = str(getattr(prompt, "status", "")) if prompt is not None else ""
+        if status not in {"running", "paused"}:
+            self._append_main_log(self._format_par(f"foreground prompt 当前状态为 {status or '(unknown)'}，无需取消。"))
+            self._request_redraw()
+            return
+        bg_task = event.app.create_background_task(self._run_command(f"cancel {prompt_id}"))
+        bg_task.add_done_callback(self._on_command_task_done)
+
     def _log_panel_text(self) -> str:
+        self._update_command_row_height()
         self._refresh_external_state()
         self._blink_on = not self._blink_on
         if self.show_welcome:
@@ -676,12 +979,56 @@ class ParagentsTUI:
         lines = self._slice_main_panel_lines(self._main_panel_lines())
         notices = self._consume_system_notices()
         header = self._main_panel_header_line()
+        self._render_debug_tick += 1
+        should_trace_frame = self._render_debug_tick % 10 == 0
         if header is None:
             body_limit = max(1, self._log_line_limit() - len(notices))
             body = lines[-body_limit:] if len(lines) > body_limit else lines
+            if should_trace_frame:
+                try:
+                    size = self.app.output.get_size()
+                    rows = int(size.rows)
+                    cols = int(size.columns)
+                except Exception:
+                    rows = 0
+                    cols = 0
+                self._trace_render_event(
+                    "RENDER_FRAME",
+                    rows=rows,
+                    cols=cols,
+                    command_bar_height=self._command_bar_height(),
+                    line_limit=self._log_line_limit(),
+                    source_lines=len(self.logs),
+                    sliced_visual_lines=len(lines),
+                    notices_count=len(notices),
+                    header_present=False,
+                    final_body_count=len(body),
+                    side_log_back_offset=self._side_log_back_offset,
+                )
             return "\n".join([*notices, *body])
         body_limit = max(1, self._log_line_limit() - 1 - len(notices))
         body = lines[-body_limit:] if len(lines) > body_limit else lines
+        if should_trace_frame:
+            try:
+                size = self.app.output.get_size()
+                rows = int(size.rows)
+                cols = int(size.columns)
+            except Exception:
+                rows = 0
+                cols = 0
+            self._trace_render_event(
+                "RENDER_FRAME",
+                rows=rows,
+                cols=cols,
+                command_bar_height=self._command_bar_height(),
+                line_limit=self._log_line_limit(),
+                source_lines=len(self.logs),
+                sliced_visual_lines=len(lines),
+                notices_count=len(notices),
+                header_present=True,
+                final_body_count=len(body),
+                side_log_back_offset=self._side_log_back_offset,
+            )
         return "\n".join([header, *notices, *body])
 
     def _log_panel_formatted(self) -> list[tuple[str, str]]:
@@ -715,7 +1062,7 @@ class ParagentsTUI:
         task_id = self.log_view_task_id or self.foreground_task_id
         if not task_id:
             return False
-        task = self.scheduler.tasks.get(task_id)
+        task = self.scheduler.prompts.get(task_id)
         if task is None:
             return False
         request_id = str(getattr(task, "local_state", {}).get("pending_approval_request_id", "")).strip()
@@ -730,7 +1077,7 @@ class ParagentsTUI:
         task_id = self.log_view_task_id or self.foreground_task_id
         if not task_id:
             return ""
-        task = self.scheduler.tasks.get(task_id)
+        task = self.scheduler.prompts.get(task_id)
         if task is None:
             return ""
         request_id = str(getattr(task, "local_state", {}).get("pending_approval_request_id", "")).strip()
@@ -762,15 +1109,42 @@ class ParagentsTUI:
         task_id = self.log_view_task_id or self.foreground_task_id
         if task_id is None:
             return False
-        if task_id not in self.scheduler.tasks:
+        if task_id not in self.scheduler.prompts:
             return False
-        watch_logs = self.scheduler.get_task_logs(task_id, limit=200)
-        seen = self._seen_count_by_task.get(task_id, 0)
-        if seen >= len(watch_logs):
+        watch_logs = self.scheduler.get_prompt_logs(task_id, limit=200)
+        if not watch_logs:
             return False
-        for line in watch_logs[seen:]:
+        previous_tail = self._watch_tail_by_task.get(task_id, [])
+        overlap = 0
+        if previous_tail:
+            max_overlap = min(len(previous_tail), len(watch_logs))
+            for size in range(max_overlap, 0, -1):
+                if previous_tail[-size:] == watch_logs[:size]:
+                    overlap = size
+                    break
+        new_lines = watch_logs[overlap:]
+        if not new_lines:
+            self._trace_render_event(
+                "RENDER_WATCH_NO_NEW_LINES",
+                task_id=task_id[:6],
+                watch_log_count=len(watch_logs),
+                overlap=overlap,
+            )
+            return False
+        for line in new_lines:
             self._ingest_watch_line(task_id, line)
+        self._watch_tail_by_task[task_id] = watch_logs
         self._seen_count_by_task[task_id] = len(watch_logs)
+        self._trace_render_event(
+            "RENDER_WATCH_APPEND",
+            task_id=task_id[:6],
+            watch_log_count=len(watch_logs),
+            previous_tail_count=len(previous_tail),
+            overlap=overlap,
+            appended_count=len(new_lines),
+            first_new_preview=self._truncate_to_display_width(new_lines[0].replace("\n", "\\n"), 120),
+            last_new_preview=self._truncate_to_display_width(new_lines[-1].replace("\n", "\\n"), 120),
+        )
         return True
 
     async def _watch_log_pump(self) -> None:
@@ -862,17 +1236,17 @@ class ParagentsTUI:
         raw = token.strip()
         if not raw:
             return None
-        if raw in self.scheduler.tasks:
+        if raw in self.scheduler.prompts:
             return raw
-        by_ref = [task_id for task_id, task in self.scheduler.tasks.items() if str(getattr(task, "task_ref", "")) == raw]
+        by_ref = [task_id for task_id, task in self.scheduler.prompts.items() if str(getattr(task, "prompt_ref", "")) == raw]
         if len(by_ref) == 1:
             return by_ref[0]
         by_ref_prefix = [
-            task_id for task_id, task in self.scheduler.tasks.items() if str(getattr(task, "task_ref", "")).startswith(raw)
+            task_id for task_id, task in self.scheduler.prompts.items() if str(getattr(task, "prompt_ref", "")).startswith(raw)
         ]
         if len(by_ref_prefix) == 1:
             return by_ref_prefix[0]
-        matched = [task_id for task_id in self.scheduler.tasks.keys() if task_id.startswith(raw)]
+        matched = [task_id for task_id in self.scheduler.prompts.keys() if task_id.startswith(raw)]
         if len(matched) == 1:
             return matched[0]
         return None
@@ -884,10 +1258,11 @@ class ParagentsTUI:
             "║                     Claude-like TUI                      ║\n"
             "╠══════════════════════════════════════════════════════════╣\n"
             "║ Welcome. Type command and press Enter.                   ║\n"
-            "║ Capacity: total task slots <= 5                          ║\n"
+            "║ Capacity: total session slots <= 5                       ║\n"
             "║ /show|/resume -> foreground | /log -> readonly history   ║\n"
-            "║ /finish <id> is required to release a task slot          ║\n"
-            "║ Tab complete | Up/Down history | Ctrl+O menu             ║\n"
+            "║ /finish <id> is required to release a session slot       ║\n"
+            "║ Tab complete | Up/Down仅多行编辑 | Ctrl+R会话历史命令    ║\n"
+            "║ Ctrl+X 取消运行中prompt | Ctrl+U 清空输入                ║\n"
             "║ Ctrl+C exit | Esc close welcome                          ║\n"
             "╚══════════════════════════════════════════════════════════╝"
         )
@@ -919,8 +1294,22 @@ class ParagentsTUI:
 
     def _submit_task_views(self) -> list[Any]:
         self._refresh_external_state()
-        logs_by_task = {tid: self.scheduler.get_task_logs(tid, limit=2000) for tid in self.scheduler.tasks}
-        views = build_task_views(self.scheduler.tasks, logs_by_task)
+        logs_by_task = {tid: self.scheduler.get_prompt_logs(tid, limit=2000) for tid in self.scheduler.prompts}
+        if (
+            self.session_slot_ids_provider is not None
+            and self.session_ref_resolver is not None
+            and self.session_active_task_resolver is not None
+        ):
+            session_views = build_session_views(
+                self.scheduler.prompts,
+                logs_by_task,
+                self.session_slot_ids_provider(),
+                self.session_ref_resolver,
+                self.session_active_task_resolver,
+            )
+            filtered = [v for v in session_views if v.task_id != self.foreground_task_id]
+            return filtered[:4]
+        views = build_prompt_views(self.scheduler.prompts, logs_by_task)
         if self.foreground_task_id:
             views = [v for v in views if v.task_id != self.foreground_task_id]
         views = [v for v in views if v.task_id in self._task_slot_ids]
@@ -968,7 +1357,7 @@ class ParagentsTUI:
         v = views[idx]
         marker, _ = self._attention_marker(v.status, v.latest_log, v.pending_approval_request_id)
         layout_hint = self._submit_panel_layout_hint(len(views), idx)
-        task_obj = self.scheduler.tasks.get(v.task_id)
+        task_obj = self.scheduler.prompts.get(v.task_id)
         initial = str(getattr(task_obj, "local_state", {}).get("initial_input", "")) if task_obj is not None else ""
         task_name = initial or (task_obj.input if task_obj is not None else "")
         task_name = task_name.strip().replace("\n", " ")
@@ -1075,7 +1464,8 @@ class ParagentsTUI:
                 self.context_selected = (self.context_selected - 1) % len(self.context_candidates)
                 return
             if event.app.layout.has_focus(self.parts.command_bar):
-                self._history_up()
+                if self._is_multiline_editing_active():
+                    self.input_buffer.cursor_up(count=1)
                 return
 
         @kb.add("down")
@@ -1087,8 +1477,33 @@ class ParagentsTUI:
                 self.context_selected = (self.context_selected + 1) % len(self.context_candidates)
                 return
             if event.app.layout.has_focus(self.parts.command_bar):
-                self._history_down()
+                if self._is_multiline_editing_active():
+                    self.input_buffer.cursor_down(count=1)
                 return
+
+        @kb.add("c-r")
+        def _session_history_popup(event) -> None:  # noqa: ANN001
+            if not event.app.layout.has_focus(self.parts.command_bar):
+                event.app.layout.focus(self.parts.command_bar)
+            self._show_session_run_history_popup()
+
+        @kb.add("c-x")
+        def _cancel_running_prompt(event) -> None:  # noqa: ANN001
+            self._cancel_active_prompt(event)
+
+        @kb.add("c-u")
+        def _clear_input(event) -> None:  # noqa: ANN001
+            if not event.app.layout.has_focus(self.parts.command_bar):
+                event.app.layout.focus(self.parts.command_bar)
+            self.input_buffer.text = ""
+            self.input_buffer.cursor_position = 0
+            self._refresh_context_popup()
+
+        @kb.add("escape", "enter")
+        def _insert_newline(event) -> None:  # noqa: ANN001
+            if not event.app.layout.has_focus(self.parts.command_bar):
+                return
+            self.input_buffer.insert_text("\n")
 
         @kb.add("pageup")
         def _page_up(event) -> None:  # noqa: ANN001, ARG001
@@ -1133,6 +1548,14 @@ class ParagentsTUI:
             if cmd:
                 effective_cmd = cmd[len("__slash__ ") :].strip() if cmd.startswith("__slash__ ") else cmd
                 display = raw if raw else cmd
+                self._trace_render_event(
+                    "RENDER_ENTER_SUBMIT",
+                    raw=raw,
+                    cmd=cmd,
+                    effective_cmd=effective_cmd,
+                    input_len=len(raw),
+                    input_wrapped_rows=self._command_bar_height(),
+                )
                 # submit 是后台任务提交，不污染 foreground 主面板日志。
                 if not effective_cmd.startswith("submit "):
                     self._append_main_log(self._format_you(display))
@@ -1191,6 +1614,12 @@ class ParagentsTUI:
             # 用户主动执行命令时，自动退出回看偏移，回到底部跟随最新输出。
             self._side_log_back_offset = 0
             effective_cmd = cmd[len("__slash__ ") :].strip() if cmd.startswith("__slash__ ") else cmd
+            self._trace_render_event(
+                "RENDER_RUN_COMMAND_START",
+                cmd=cmd,
+                effective_cmd=effective_cmd,
+                side_log_back_offset=self._side_log_back_offset,
+            )
             output = await self.command_handler(cmd)
             if self.foreground_task_id_provider is not None or self.task_slot_ids_provider is not None:
                 self._refresh_external_state()
@@ -1203,13 +1632,26 @@ class ParagentsTUI:
                     "提示: 非 / 开头输入会自动按有无 foreground 映射为 /new 或 /run。",
                 ]
             lines = self._shorten_ids(output if output else ["(no output)"])
+            self._trace_render_event(
+                "RENDER_RUN_COMMAND_OUTPUT",
+                effective_cmd=effective_cmd,
+                output_count=len(lines),
+                first_output_preview=self._truncate_to_display_width((lines[0] if lines else "").replace("\n", "\\n"), 120),
+            )
             if any("槽位已满" in line for line in lines):
                 for line in lines:
                     self._push_system_notice(self._format_par(line), ttl=2)
             elif not effective_cmd.startswith("submit "):
-                lines = [line for line in lines if not line.startswith("continued in foreground:")]
+                lines = [line for line in lines if not line.startswith("continued in foreground session:")]
                 self._extend_main_logs([self._format_par(line) for line in lines])
+            self._record_session_history_command(effective_cmd)
             self._request_redraw()
+            self._trace_render_event(
+                "RENDER_RUN_COMMAND_DONE",
+                effective_cmd=effective_cmd,
+                logs_len=len(self.logs),
+                side_log_back_offset=self._side_log_back_offset,
+            )
             self.app.layout.focus(self.parts.command_bar)
         except Exception as exc:  # noqa: BLE001
             self._append_main_log(self._format_par(f"[TUI ERROR] command '{cmd}' failed: {exc}"))
@@ -1291,6 +1733,9 @@ async def run_tui(
     command_handler: Callable[[str], Awaitable[list[str]]],
     foreground_task_id_provider: Callable[[], str | None] | None = None,
     task_slot_ids_provider: Callable[[], list[str]] | None = None,
+    session_slot_ids_provider: Callable[[], list[str]] | None = None,
+    session_ref_resolver: Callable[[str], str] | None = None,
+    session_active_task_resolver: Callable[[str], str | None] | None = None,
     finish_candidate_task_ids_provider: Callable[[], list[str]] | None = None,
     show_candidate_task_ids_provider: Callable[[], list[str]] | None = None,
     approve_candidate_request_refs_provider: Callable[[], list[str]] | None = None,
@@ -1303,6 +1748,9 @@ async def run_tui(
         command_handler=command_handler,
         foreground_task_id_provider=foreground_task_id_provider,
         task_slot_ids_provider=task_slot_ids_provider,
+        session_slot_ids_provider=session_slot_ids_provider,
+        session_ref_resolver=session_ref_resolver,
+        session_active_task_resolver=session_active_task_resolver,
         finish_candidate_task_ids_provider=finish_candidate_task_ids_provider,
         show_candidate_task_ids_provider=show_candidate_task_ids_provider,
         approve_candidate_request_refs_provider=approve_candidate_request_refs_provider,
