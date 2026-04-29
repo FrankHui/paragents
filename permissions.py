@@ -113,6 +113,7 @@ class PermissionManager:
             return mgr
 
         raw = json.loads(path.read_text(encoding="utf-8"))
+        defaults = PermissionsConfig()
         scopes = [
             FsScope(
                 path=str(item.get("path", "")),
@@ -122,12 +123,12 @@ class PermissionManager:
             for item in raw.get("fs_scopes", [])
         ]
         config = PermissionsConfig(
-            capabilities=dict(raw.get("capabilities", {})) or PermissionsConfig().capabilities,
+            capabilities={**defaults.capabilities, **dict(raw.get("capabilities", {}))},
             fs_scopes=scopes,
-            shell_policy=dict(raw.get("shell_policy", {})) or PermissionsConfig().shell_policy,
-            python_policy=dict(raw.get("python_policy", {})) or PermissionsConfig().python_policy,
-            git_policy=dict(raw.get("git_policy", {})) or PermissionsConfig().git_policy,
-            github_policy=dict(raw.get("github_policy", {})) or PermissionsConfig().github_policy,
+            shell_policy={**defaults.shell_policy, **dict(raw.get("shell_policy", {}))},
+            python_policy={**defaults.python_policy, **dict(raw.get("python_policy", {}))},
+            git_policy={**defaults.git_policy, **dict(raw.get("git_policy", {}))},
+            github_policy={**defaults.github_policy, **dict(raw.get("github_policy", {}))},
         )
         return cls(config, path)
 
@@ -181,7 +182,13 @@ class PermissionManager:
             reason=f"{capability} capability waiting for approval",
         )
 
-    def check_fs_access(self, raw_path: str, mode: str) -> PermissionDecision:
+    def check_fs_access(
+        self,
+        raw_path: str,
+        mode: str,
+        prompt_id: str | None = None,
+        session_id: str | None = None,
+    ) -> PermissionDecision:
         target = Path(raw_path).expanduser().resolve()
         for scope in self._config.fs_scopes:
             base = Path(scope.path).expanduser().resolve()
@@ -204,6 +211,8 @@ class PermissionManager:
             request_ref=request_ref,
             request_type="fs_scope",
             payload={"path": str(target), "mode": mode},
+            owner_prompt_id=prompt_id,
+            owner_session_id=session_id,
         )
         return PermissionDecision(
             allowed=False,
@@ -359,6 +368,8 @@ class PermissionManager:
         if key in self._session_approved_github_actions.get(scope, set()):
             return PermissionDecision(allowed=True)
         policy = self._config.github_policy
+        if key in policy.get("auto_approved_actions", []):
+            return PermissionDecision(allowed=True)
         if normalized_method in [m.upper() for m in policy.get("auto_approved_methods", [])]:
             return PermissionDecision(allowed=True)
         if normalized_method in [m.upper() for m in policy.get("needs_approval_methods", [])]:
@@ -451,6 +462,9 @@ class PermissionManager:
             self._session_approved_github_actions.setdefault(scope, set()).add(action)
             self._pending_github_by_action.pop((scope, action), None)
             if always:
+                auto_actions = self._config.github_policy.setdefault("auto_approved_actions", [])
+                if action not in auto_actions:
+                    auto_actions.append(action)
                 self.save()
         if req.request_type == "capability_enable":
             capability = req.payload["capability"]
