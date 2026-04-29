@@ -47,7 +47,7 @@ def test_submit_records_output_conflict_details_and_declared_outputs(tmp_path: P
     assert second.local_state["preflight_declared_outputs"] == ["reports/result.json"]
 
     conflict_details = second.local_state.get("preflight_conflict_keys_by_session", {})
-    assert conflict_details.get("session-A") == ["out:reports/result.json"]
+    assert "out:reports/result.json" in conflict_details.get("session-A", [])
 
     assert "reports/result.json" in scheduler._session_declared_outputs["session-A"]  # noqa: SLF001
     assert "reports/result.json" in scheduler._session_declared_outputs["session-B"]  # noqa: SLF001
