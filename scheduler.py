@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_instance import AgentInstance
+from hook_runtime import HookRuntime
 from id_refs import generate_short_ref
 from llm_client import LLMClient
 from task import Prompt
@@ -39,6 +40,7 @@ class Scheduler:
         self._scheduled_meta: dict[str, float] = {}
         self._runs_root = Path.cwd() / ".paragents" / "runs"
         self._debug_enabled = os.getenv("PARAGENTS_TUI_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+        self._hook_runtime = HookRuntime.load_from_path(Path.cwd() / ".paragents" / "hooks.json")
 
     @property
     def prompts(self) -> dict[str, Prompt]:
@@ -371,6 +373,7 @@ class Scheduler:
                 llm_client=self._llm_client,
                 tools=tools,
                 event_callback=lambda msg, tid=task_id: self._publish_log(tid, msg),
+                hook_runtime=self._hook_runtime,
             )
             self._running[task_id] = asyncio.create_task(self._run_agent(task_id, agent))
 
