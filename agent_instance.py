@@ -6,7 +6,7 @@ from typing import Any
 
 from hook_runtime import HookRuntime
 from llm_client import LLMClient
-from memory import LocalMemory
+from memory import LayeredContext, LocalMemory, summarize_local_memory
 from task import Prompt
 from tools import ToolRegistry
 
@@ -27,22 +27,17 @@ class AgentInstance:
         self.hook_runtime = hook_runtime
         self.memory = LocalMemory()
         tool_names = self.tools.list_tool_names()
-        self.context: list[dict[str, str]] = [
-            {
-                "role": "system",
-                "content": (
-                    "You are an autonomous agent.\n"
-                    "You must respond with strict JSON only.\n"
-                    "Allowed output schema:\n"
-                    '1) {"type":"final","content":"..."}\n'
-                    '2) {"type":"tool","tool_name":"...","args":{...}}\n'
-                    f"Allowed tools: {tool_names}\n"
-                    "If you can answer directly, use final.\n"
-                    "Do not output markdown fences."
-                ),
-            },
-            {"role": "user", "content": task.input},
-        ]
+        self._system_prompt = (
+            "You are an autonomous agent.\n"
+            "You must respond with strict JSON only.\n"
+            "Allowed output schema:\n"
+            '1) {"type":"final","content":"..."}\n'
+            '2) {"type":"tool","tool_name":"...","args":{...}}\n'
+            f"Allowed tools: {tool_names}\n"
+            "If you can answer directly, use final.\n"
+            "Do not output markdown fences."
+        )
+        self.layered_context = LayeredContext(self._system_prompt, task.input, max_recent_turns=8)
 
     def _emit(self, message: str) -> None:
         if self._event_callback is not None:
@@ -123,7 +118,8 @@ class AgentInstance:
                     await asyncio.sleep(0.1)
 
             self._emit(f"step={step + 1}: llm infer")
-            llm_output = await self.llm_client.infer(self.context)
+            llm_input = self.layered_context.export_for_infer()
+            llm_output = await self.llm_client.infer(llm_input)
             output_type = llm_output.get("type")
 
             if output_type == "final":
@@ -159,6 +155,8 @@ class AgentInstance:
                 observation = await self.tools.call(tool_name, args)
                 await self.memory.append({"tool": tool_name, "args": args, "observation": observation})
                 self.task.local_state["last_observation"] = observation
+                memory_items = await self.memory.snapshot()
+                self.task.local_state["memory_summary"] = summarize_local_memory(memory_items)
                 self._emit_stream_preview(tool_name, observation)
                 if self.hook_runtime is not None:
                     post_decision = self.hook_runtime.on_post_tool_use(
@@ -193,16 +191,12 @@ class AgentInstance:
                         self._emit(f"waiting for approval request_id={request_id}")
                     return
                 # 使用纯文本 assistant/user 轮次，避免 OpenAI tool role 的 tool_call_id 协议要求。
-                self.context.append({"role": "assistant", "content": str(llm_output)})
-                self.context.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Tool observation for {tool_name}: {observation}. "
-                            "Continue and return JSON only."
-                        ),
-                    }
+                self.layered_context.append_turn("assistant", str(llm_output))
+                self.layered_context.append_turn(
+                    "user",
+                    f"Tool observation for {tool_name}: {observation}. Continue and return JSON only.",
                 )
+                self.task.local_state["context_snapshot"] = self.layered_context.snapshot()
                 self.task.touch()
                 self._emit(f"step={step + 1}: tool observation received")
                 continue
