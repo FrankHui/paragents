@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from preflight_intent import infer_preflight_intent
+from preflight_intent import infer_preflight_intent, infer_preflight_intent_with_llm
 from scheduler import Scheduler
 
 
@@ -10,6 +10,17 @@ class _SleepLLM:
     async def infer(self, messages):  # noqa: ANN001
         await asyncio.sleep(0.2)
         return {"type": "final", "content": "ok"}
+
+
+class _PreflightLLM:
+    async def infer(self, messages):  # noqa: ANN001
+        _ = messages
+        return {
+            "content": (
+                '{"capabilities":["python"],"actions":[],"output_paths":["reports/llm-out.txt"],'
+                '"confidence":0.91,"notes":["llm inferred output"]}'
+            )
+        }
 
 
 def test_infer_preflight_intent_detects_implicit_git_and_output() -> None:
@@ -60,6 +71,14 @@ def test_continue_task_recomputes_preflight_intent() -> None:
     assert "git" in intent_state.get("capabilities", [])
     assert "git:commit" in keys
     assert "out:reports/new.json" in keys
+
+
+def test_infer_preflight_intent_with_llm_augments_rule_result() -> None:
+    intent = asyncio.run(infer_preflight_intent_with_llm("普通一句话", _PreflightLLM()))
+    keys = intent.to_resource_keys()
+    assert "perm:python" in keys
+    assert "out:reports/llm-out.txt" in keys
+    assert intent.confidence >= 0.9
 
 
 def test_dispatch_not_blocked_by_unrelated_running_prompt_in_blocker_session() -> None:

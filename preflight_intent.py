@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import asdict, dataclass, field
+from typing import Any
 
 
 @dataclass(slots=True)
@@ -76,3 +78,70 @@ def infer_preflight_intent(text: str) -> PreflightIntent:
         intent.confidence = 0.48
 
     return intent
+
+
+def _merge_intents(primary: PreflightIntent, secondary: PreflightIntent) -> PreflightIntent:
+    merged = PreflightIntent()
+    merged.capabilities = set(primary.capabilities).union(secondary.capabilities)
+    merged.actions = set(primary.actions).union(secondary.actions)
+    merged.output_paths = set(primary.output_paths).union(secondary.output_paths)
+    merged.notes = [*primary.notes, *secondary.notes]
+    merged.confidence = max(float(primary.confidence), float(secondary.confidence))
+    return merged
+
+
+def _intent_from_obj(obj: dict[str, Any]) -> PreflightIntent:
+    intent = PreflightIntent()
+    caps = obj.get("capabilities", [])
+    actions = obj.get("actions", [])
+    outputs = obj.get("output_paths", [])
+    notes = obj.get("notes", [])
+    confidence = obj.get("confidence", 0.35)
+    if isinstance(caps, list):
+        intent.capabilities = {str(x).strip() for x in caps if str(x).strip()}
+    if isinstance(actions, list):
+        intent.actions = {str(x).strip() for x in actions if str(x).strip()}
+    if isinstance(outputs, list):
+        intent.output_paths = {str(x).strip().lstrip("./") for x in outputs if str(x).strip()}
+    if isinstance(notes, list):
+        intent.notes = [str(x) for x in notes]
+    try:
+        intent.confidence = float(confidence)
+    except Exception:
+        intent.confidence = 0.35
+    return intent
+
+
+async def infer_preflight_intent_with_llm(text: str, llm_client: Any | None = None) -> PreflightIntent:
+    rule_intent = infer_preflight_intent(text)
+    if llm_client is None:
+        return rule_intent
+    prompt = (
+        "请从以下用户输入中提取最小预判意图，仅用于并发冲突和权限预估。\n"
+        "输出严格JSON对象，不要markdown，不要解释。\n"
+        "schema: {\"capabilities\":[str],\"actions\":[str],\"output_paths\":[str],\"confidence\":float,\"notes\":[str]}\n"
+        "capabilities候选: filesystem,shell,python,git,github,web,mcp\n"
+        "actions示例: git:commit,git:push,github:write\n"
+        "output_paths仅保留可能写入目标路径。\n"
+        f"输入: {text}"
+    )
+    messages = [{"role": "user", "content": prompt}]
+    try:
+        output = await llm_client.infer(messages)
+    except Exception:
+        return rule_intent
+    llm_obj: dict[str, Any] | None = None
+    if isinstance(output, dict):
+        if {"capabilities", "actions", "output_paths"}.intersection(set(output.keys())):
+            llm_obj = output
+        elif isinstance(output.get("content"), str):
+            content = str(output.get("content", "")).strip()
+            if content:
+                try:
+                    llm_obj = json.loads(content)
+                except Exception:
+                    llm_obj = None
+    if not isinstance(llm_obj, dict):
+        return rule_intent
+    llm_intent = _intent_from_obj(llm_obj)
+    return _merge_intents(rule_intent, llm_intent)

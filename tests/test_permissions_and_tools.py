@@ -357,3 +357,31 @@ def test_python_route_keeps_scope_and_prompt_run_dir(tmp_path: Path) -> None:
     )
     assert second["ok"] is True
     assert str(run_dir) in second.get("stdout", "")
+
+
+def test_python_redirect_out_of_scope_requires_fs_write_approval(tmp_path: Path) -> None:
+    allowed = tmp_path / "allowed"
+    denied = tmp_path / "denied"
+    allowed.mkdir()
+    denied.mkdir()
+    manager = _build_manager(tmp_path, [FsScope(path=str(allowed), read=True, write=True)])
+    tools = create_default_tools(manager)
+    target = denied / "aaa.txt"
+
+    result = asyncio.run(
+        tools["run_command"](
+            {
+                "command": f"python3 -c \"print('ok')\" > {target}",
+                "_prompt_id": "prompt-write-1",
+                "_session_id": "session-write-1",
+            }
+        )
+    )
+    assert result["ok"] is False
+    assert result["needs_approval"] is True
+    request_id = result["request_id"]
+    req = manager.get_pending(request_id)
+    assert req is not None
+    assert req.request_type == "fs_scope"
+    assert req.payload["mode"] == "write"
+    assert Path(req.payload["path"]).resolve() == target.resolve()

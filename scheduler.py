@@ -14,7 +14,7 @@ from agent_instance import AgentInstance
 from hook_runtime import HookRuntime
 from id_refs import generate_short_ref
 from llm_client import LLMClient
-from preflight_intent import infer_preflight_intent
+from preflight_intent import infer_preflight_intent_with_llm
 from task import Prompt
 from tools import ToolRegistry
 
@@ -179,21 +179,26 @@ class Scheduler:
             output = output[2:]
         return output
 
-    def _build_preflight_resource_keys(self, text: str) -> tuple[set[str], dict[str, object]]:
-        intent = infer_preflight_intent(text)
+    async def _build_preflight_resource_keys(self, text: str) -> tuple[set[str], dict[str, object]]:
+        intent = await infer_preflight_intent_with_llm(text, self._llm_client)
         keys = self._extract_resource_keys(text)
         keys.update(intent.to_resource_keys())
         return keys, intent.to_state()
 
+    def _output_conflict_keys(self, keys: set[str]) -> set[str]:
+        return {key for key in keys if key.startswith("out:")}
+
     def _preflight_conflicts(self, session_id: str, resource_keys: set[str]) -> tuple[list[str], dict[str, list[str]]]:
-        if not resource_keys:
+        current_output_keys = self._output_conflict_keys(resource_keys)
+        if not current_output_keys:
             return [], {}
         conflicts: list[str] = []
         details: dict[str, list[str]] = {}
         for other_session, other_keys in self._session_preflight_resources.items():
             if other_session == session_id:
                 continue
-            overlap = sorted(resource_keys.intersection(other_keys))
+            other_output_keys = self._output_conflict_keys(other_keys)
+            overlap = sorted(current_output_keys.intersection(other_output_keys))
             if overlap:
                 conflicts.append(other_session)
                 details[other_session] = overlap
@@ -275,7 +280,7 @@ class Scheduler:
             run_dir=str(run_dir),
             status="pending",
         )
-        preflight_keys, preflight_intent = self._build_preflight_resource_keys(user_input)
+        preflight_keys, preflight_intent = await self._build_preflight_resource_keys(user_input)
         conflict_sessions, conflict_details = self._preflight_conflicts(session_id, preflight_keys)
         declared_outputs = sorted(key[4:] for key in preflight_keys if key.startswith("out:"))
         prompt.local_state = {
@@ -290,6 +295,8 @@ class Scheduler:
             "preflight_declared_outputs": declared_outputs,
             "preflight_decision": "serialize" if conflict_sessions else "allow",
             "preflight_user_override": False,
+            "preflight_decision_required": bool(conflict_sessions),
+            "preflight_blocking_notice_emitted": False,
         }
         prompt.local_state.setdefault("initial_input", user_input)
         self._prompts[task_id] = prompt
@@ -313,7 +320,7 @@ class Scheduler:
         prompt.input = user_input
         prompt.result = None
         prompt.error = None
-        preflight_keys, preflight_intent = self._build_preflight_resource_keys(user_input)
+        preflight_keys, preflight_intent = await self._build_preflight_resource_keys(user_input)
         conflict_sessions, conflict_details = self._preflight_conflicts(prompt.session_id, preflight_keys)
         declared_outputs = sorted(key[4:] for key in preflight_keys if key.startswith("out:"))
         prompt.local_state["preflight_intent"] = preflight_intent
@@ -322,6 +329,8 @@ class Scheduler:
         prompt.local_state["preflight_conflict_keys_by_session"] = conflict_details
         prompt.local_state["preflight_declared_outputs"] = declared_outputs
         prompt.local_state["preflight_decision"] = "serialize" if conflict_sessions else "allow"
+        prompt.local_state["preflight_decision_required"] = bool(conflict_sessions)
+        prompt.local_state["preflight_blocking_notice_emitted"] = False
         self._session_preflight_resources.setdefault(prompt.session_id, set()).update(preflight_keys)
         self._session_declared_outputs.setdefault(prompt.session_id, set()).update(declared_outputs)
         prompt.status = "pending"
@@ -407,12 +416,24 @@ class Scheduler:
             blockers = set(prompt.local_state.get("preflight_conflict_with_sessions", []))
             declared_outputs = list(prompt.local_state.get("preflight_declared_outputs", []))
             allow_override = bool(prompt.local_state.get("preflight_user_override", False))
+            needs_user_decision = bool(prompt.local_state.get("preflight_decision_required", False))
+            if needs_user_decision and not allow_override:
+                if not bool(prompt.local_state.get("preflight_blocking_notice_emitted", False)):
+                    session_refs = ", ".join(sorted(blockers)) if blockers else "(unknown)"
+                    self._publish_log(
+                        task_id,
+                        f"conflict decision pending: waiting on serialize conflicts: {session_refs}; use /override or /cancel",
+                    )
+                    prompt.local_state["preflight_blocking_notice_emitted"] = True
+                await self._pending_queue.put(task_id)
+                await asyncio.sleep(0.05)
+                continue
             if session_id and blockers and not allow_override:
                 blocking = False
-                current_keys = set(prompt.local_state.get("preflight_resource_keys", []))
+                current_keys = self._output_conflict_keys(set(prompt.local_state.get("preflight_resource_keys", [])))
                 for other_task_id, other_task in self._prompts.items():
                     other_session_id = self._task_to_session.get(other_task_id)
-                    other_keys = set(other_task.local_state.get("preflight_resource_keys", []))
+                    other_keys = self._output_conflict_keys(set(other_task.local_state.get("preflight_resource_keys", [])))
                     if (
                         other_session_id in blockers
                         and other_task.status in {"running", "paused"}

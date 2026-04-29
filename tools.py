@@ -479,7 +479,7 @@ async def run_command_tool(args: dict[str, Any], permission_manager: PermissionM
             {
                 **args,
                 "command": command,
-                "timeout_s": args.get("timeout_s", 10),
+                "timeout_s": args.get("timeout_s", 60),
             },
             permission_manager,
         )
@@ -487,6 +487,15 @@ async def run_command_tool(args: dict[str, Any], permission_manager: PermissionM
     prompt_id = str(args.get("_prompt_id", "")).strip() or None
     session_id = str(args.get("_session_id", "")).strip() or None
     run_dir = str(args.get("_prompt_run_dir", "")).strip()
+    fs_guard = _check_output_write_permission(
+        command=command,
+        permission_manager=permission_manager,
+        prompt_id=prompt_id,
+        session_id=session_id,
+        run_dir=run_dir,
+    )
+    if fs_guard is not None:
+        return fs_guard
     cap_decision = permission_manager.check_capability_decision("shell", prompt_id=prompt_id, session_id=session_id)
     if not cap_decision.allowed:
         return {
@@ -509,7 +518,7 @@ async def run_command_tool(args: dict[str, Any], permission_manager: PermissionM
             }
         return {"ok": False, "error": decision.reason or "Command blocked"}
 
-    timeout_s = float(args.get("timeout_s", 10) or 10)
+    timeout_s = float(args.get("timeout_s", 60) or 60)
     timeout_s = max(1, min(timeout_s, 120))
     try:
         proc = await asyncio.create_subprocess_shell(
@@ -554,6 +563,15 @@ async def run_python_tool(args: dict[str, Any], permission_manager: PermissionMa
     prompt_id = str(args.get("_prompt_id", "")).strip() or None
     session_id = str(args.get("_session_id", "")).strip() or None
     run_dir = str(args.get("_prompt_run_dir", "")).strip()
+    fs_guard = _check_output_write_permission(
+        command=command,
+        permission_manager=permission_manager,
+        prompt_id=prompt_id,
+        session_id=session_id,
+        run_dir=run_dir,
+    )
+    if fs_guard is not None:
+        return fs_guard
     decision = permission_manager.check_python_command(command, prompt_id=prompt_id, session_id=session_id)
     if not decision.allowed:
         if decision.request_id:
@@ -566,7 +584,7 @@ async def run_python_tool(args: dict[str, Any], permission_manager: PermissionMa
             }
         return {"ok": False, "error": decision.reason or "Python command blocked"}
 
-    timeout_s = float(args.get("timeout_s", 10) or 10)
+    timeout_s = float(args.get("timeout_s", 60) or 60)
     timeout_s = max(1, min(timeout_s, 120))
 
     try:
@@ -603,6 +621,61 @@ async def run_python_tool(args: dict[str, Any], permission_manager: PermissionMa
         }
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
+
+
+def _extract_output_paths_from_command(command: str) -> set[str]:
+    outputs: set[str] = set()
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    for match in re.findall(r"(?:^|\s)(?:>>|>)\s*([^\s|;&]+)", command):
+        cleaned = match.strip().strip("'\"").rstrip(",;")
+        if cleaned:
+            outputs.add(cleaned)
+    for idx, token in enumerate(tokens):
+        lowered = token.lower()
+        if lowered != "tee":
+            continue
+        cursor = idx + 1
+        while cursor < len(tokens) and tokens[cursor].startswith("-"):
+            cursor += 1
+        if cursor < len(tokens):
+            outputs.add(tokens[cursor].strip().strip("'\"").rstrip(",;"))
+    return {p for p in outputs if p}
+
+
+def _resolve_output_target(raw: str, run_dir: str) -> str:
+    p = Path(raw).expanduser()
+    if p.is_absolute():
+        return str(p.resolve())
+    base = Path(run_dir).expanduser() if run_dir else Path.cwd()
+    return str((base / p).resolve())
+
+
+def _check_output_write_permission(
+    command: str,
+    permission_manager: PermissionManager,
+    prompt_id: str | None,
+    session_id: str | None,
+    run_dir: str,
+) -> dict[str, Any] | None:
+    outputs = _extract_output_paths_from_command(command)
+    for raw in sorted(outputs):
+        target = _resolve_output_target(raw, run_dir)
+        decision = permission_manager.check_fs_access(target, "write", prompt_id=prompt_id, session_id=session_id)
+        if decision.allowed:
+            continue
+        if decision.request_id:
+            return {
+                "ok": False,
+                "error": decision.reason or "Path not in allowed scope for write",
+                "needs_approval": True,
+                "request_id": decision.request_id,
+                **_approval_meta(permission_manager, decision.request_id),
+            }
+        return {"ok": False, "error": decision.reason or "Path not in allowed scope for write"}
+    return None
 
 
 _ALLOWED_BIN_OPS = {
