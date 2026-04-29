@@ -755,11 +755,14 @@ async def _run_tui_mode() -> None:
             "switch",
             "resume ",
             "close ",
+            "close",
             "override ",
+            "override",
             "approvals",
             "approve ",
             "deny ",
             "cancel ",
+            "cancel",
             "pause ",
             "retry ",
             "schedule ",
@@ -792,6 +795,24 @@ async def _run_tui_mode() -> None:
                 foreground_prompt_id = None
                 log_prompt_id = None
             return [f"已 close 会话 {_session_ref(scheduler, target_session_id)}，已释放槽位。"]
+        if cmd == "override":
+            _refresh_task_state()
+            target_prompt_id = foreground_prompt_id
+            if target_prompt_id is None:
+                return ["缺少 session_id。用法: /override <session_ref>。当前无 foreground 会话。"]
+            target_prompt = scheduler.prompts.get(target_prompt_id)
+            if target_prompt is None:
+                return ["缺少 session_id。用法: /override <session_ref>。"]
+            if not bool(getattr(target_prompt, "local_state", {}).get("preflight_decision_required", False)):
+                return ["当前 foreground 会话没有待决冲突，无需 /override。"]
+            target_session_id = scheduler.get_prompt_session_id(target_prompt_id)
+            if not target_session_id:
+                return ["当前 foreground 会话无法解析 session_id，请使用 /override <session_ref>。"]
+            target_prompt.local_state["preflight_user_override"] = True
+            target_prompt.local_state["preflight_decision_required"] = False
+            target_prompt.local_state["preflight_blocking_notice_emitted"] = False
+            target_prompt.touch()
+            return [f"已允许会话 {_session_ref(scheduler, target_session_id)} 继续执行（可能覆盖输出）。"]
         if cmd.startswith("override "):
             raw_id = cmd.split(" ", 1)[1].strip()
             target_session_id = _resolve_slot_session_id(raw_id)
@@ -808,6 +829,8 @@ async def _run_tui_mode() -> None:
             if prompt is None:
                 return [f"会话 {_session_ref(scheduler, target_session_id)} 当前无可执行 prompt。"]
             prompt.local_state["preflight_user_override"] = True
+            prompt.local_state["preflight_decision_required"] = False
+            prompt.local_state["preflight_blocking_notice_emitted"] = False
             prompt.touch()
             return [f"已允许会话 {_session_ref(scheduler, target_session_id)} 继续执行（可能覆盖输出）。"]
         finish_indices = _parse_finish_indices(cmd.replace("close", "finish", 1))
@@ -863,7 +886,7 @@ async def _run_tui_mode() -> None:
                 conflict_refs = ", ".join(_session_ref(scheduler, sid) for sid in conflict_sessions)
                 out.extend(
                     [
-                        f"检测到输出冲突，默认 serialize 等待会话: {conflict_refs}",
+                        f"检测到输出冲突（需决策）: {conflict_refs}",
                         f"取消本次prompt: /cancel {_prompt_ref(scheduler.prompts, task_id)}",
                         f"继续（可能覆盖）: /override {_session_ref(scheduler, session_id)}",
                     ]
@@ -884,7 +907,19 @@ async def _run_tui_mode() -> None:
                 return [f"foreground 会话 {_prompt_ref(scheduler.prompts, foreground_prompt_id)} 当前不可续跑。"]
             log_prompt_id = None
             pending_run_request_id = None
-            return [f"continued in foreground session: {_prompt_ref(scheduler.prompts, foreground_prompt_id)}"]
+            out = [f"continued in foreground session: {_prompt_ref(scheduler.prompts, foreground_prompt_id)}"]
+            fg_prompt = scheduler.prompts.get(foreground_prompt_id)
+            conflict_sessions = list(getattr(fg_prompt, "local_state", {}).get("preflight_conflict_with_sessions", []))
+            if conflict_sessions:
+                conflict_refs = ", ".join(_session_ref(scheduler, sid) for sid in conflict_sessions)
+                out.extend(
+                    [
+                        f"检测到输出冲突（需决策）: {conflict_refs}",
+                        f"取消本次prompt: /cancel {_prompt_ref(scheduler.prompts, foreground_prompt_id)}",
+                        "继续（可能覆盖）: /override <当前session_ref>",
+                    ]
+                )
+            return out
 
         submit_content = _parse_submit(cmd)
         if submit_content is not None:
@@ -904,7 +939,7 @@ async def _run_tui_mode() -> None:
                 conflict_refs = ", ".join(_session_ref(scheduler, sid) for sid in conflict_sessions)
                 out.extend(
                     [
-                        f"检测到输出冲突，默认 serialize 等待会话: {conflict_refs}",
+                        f"检测到输出冲突（需决策）: {conflict_refs}",
                         f"取消本次prompt: /cancel {_prompt_ref(scheduler.prompts, task_id)}",
                         f"继续（可能覆盖）: /override {_session_ref(scheduler, session_id)}",
                     ]
@@ -941,6 +976,9 @@ async def _run_tui_mode() -> None:
                 session_id = scheduler.get_prompt_session_id(task_id)
             if session_id is None or session_id in finished_session_ids:
                 return [f"会话已 close 并释放，不支持 /switch。"]
+            current_session_id = scheduler.get_prompt_session_id(foreground_prompt_id) if foreground_prompt_id else None
+            if current_session_id and session_id == current_session_id:
+                return [f"已经在当前会话 {_session_ref(scheduler, session_id)}。"]
             active_task_id = scheduler.get_session_active_task_id(session_id)
             if active_task_id is None:
                 return [f"会话 {_session_ref(scheduler, session_id)} 当前无可展示任务。"]
@@ -950,6 +988,11 @@ async def _run_tui_mode() -> None:
         if cmd.startswith("cancel "):
             await scheduler.cancel(cmd.split(" ", 1)[1].strip())
             return ["cancel signal sent"]
+        if cmd == "cancel":
+            if foreground_prompt_id is None:
+                return ["缺少 prompt_id。用法: /cancel <prompt_ref>。当前无 foreground 会话。"]
+            await scheduler.cancel(foreground_prompt_id)
+            return [f"cancel signal sent: {_prompt_ref(scheduler.prompts, foreground_prompt_id)}"]
         if cmd.startswith("pause "):
             await scheduler.pause(cmd.split(" ", 1)[1].strip())
             _refresh_task_state()

@@ -204,6 +204,7 @@ class ParagentsTUI:
                 "/list",
                 "/switch",
                 "/close",
+                "/override",
                 "/approvals",
                 "/approve",
                 "/deny",
@@ -223,6 +224,7 @@ class ParagentsTUI:
             "/list",
             "/switch",
             "/close",
+            "/override",
             "/approvals",
             "/approve",
             "/deny",
@@ -245,7 +247,7 @@ class ParagentsTUI:
         self.selected_task_id: str | None = None
         self.show_welcome = True
         self.show_options = False
-        self.context_popup_mode: str | None = None  # slash | close | switch | approve | deny | None
+        self.context_popup_mode: str | None = None  # slash | close | switch | override | cancel | approve | deny | None
         self.context_candidates: list[tuple[str, str]] = []
         self.context_selected = 0
         self._session_command_history: dict[str, list[str]] = {}
@@ -256,6 +258,8 @@ class ParagentsTUI:
             ("/approvals", "/approvals"),
             ("/switch <session_id>", "/switch "),
             ("/close <session_id>", "/close "),
+            ("/override <prompt_ref>", "/override "),
+            ("/cancel <prompt_ref>", "/cancel "),
             ("/approve <id>", "/approve "),
             ("/deny <id>", "/deny "),
             ("/pause <task_id>", "/pause "),
@@ -454,6 +458,7 @@ class ParagentsTUI:
                 "separator": "bg:#0b1020 #3b82f6",
                 "hint.scroll": "bg:#08121f #67e8f9 bold",
                 "status.approval": "fg:#fbbf24 bold",
+                "status.conflict": "fg:#fb7185 bold",
                 "status.paused": "fg:#f59e0b",
                 "status.failed": "fg:#ef4444 bold",
                 "status.completed_ack": "fg:#22d3ee bold",
@@ -505,10 +510,12 @@ class ParagentsTUI:
         mode: str | None = None
         if lower.startswith("/"):
             command_head = lower.split(" ", 1)[0]
-            if command_head in {"/close", "/switch", "/approve", "/deny"}:
+            if command_head in {"/close", "/switch", "/override", "/cancel", "/approve", "/deny"}:
                 mode_map = {
                     "/close": "close",
                     "/switch": "switch",
+                    "/override": "override",
+                    "/cancel": "cancel",
                     "/approve": "approve",
                     "/deny": "deny",
                 }
@@ -527,6 +534,10 @@ class ParagentsTUI:
             mode = "close"
         elif re.fullmatch(r"switch(?:\s.*)?", lower):
             mode = "switch"
+        elif re.fullmatch(r"override(?:\s.*)?", lower):
+            mode = "override"
+        elif re.fullmatch(r"cancel(?:\s.*)?", lower):
+            mode = "cancel"
         elif re.fullmatch(r"approve(?:\s.*)?", lower):
             mode = "approve"
         elif re.fullmatch(r"deny(?:\s.*)?", lower):
@@ -629,14 +640,39 @@ class ParagentsTUI:
             provider = self.show_candidate_task_ids_provider
             if provider is None:
                 return []
+            current_session_id = self._current_session_id()
             result: list[tuple[str, str]] = []
             for task_id in provider():
                 task = self.scheduler.prompts.get(task_id)
                 if task is None:
                     continue
                 session_id = self.scheduler.get_prompt_session_id(task_id) or ""
+                if current_session_id and session_id == current_session_id:
+                    continue
                 seed = self._session_seed_content(session_id, max_len=52) if session_id else "(empty)"
                 token = self._session_ref_by_task(task_id)
+                result.append((token, f"{token} {seed}"))
+            return result
+        if mode in {"override", "cancel"}:
+            current_session_id = self._current_session_id()
+            if not current_session_id:
+                return []
+            session_task_ids = self.scheduler.get_session_task_ids(current_session_id)
+            result: list[tuple[str, str]] = []
+            for task_id in session_task_ids:
+                task = self.scheduler.prompts.get(task_id)
+                if task is None:
+                    continue
+                state = getattr(task, "local_state", {})
+                decision_required = bool(state.get("preflight_decision_required", False))
+                overridden = bool(state.get("preflight_user_override", False))
+                if not decision_required or overridden:
+                    continue
+                if task.status in {"completed", "cancelled", "failed"}:
+                    continue
+                token = self._task_ref(task_id)
+                seed = str(getattr(task, "input", "")).strip().replace("\n", " ")
+                seed = self._truncate_to_display_width(seed or "(empty)", 40)
                 result.append((token, f"{token} {seed}"))
             return result
         if mode == "session_run_history":
@@ -675,6 +711,8 @@ class ParagentsTUI:
             "slash": " COMMAND Candidates ",
             "close": " CLOSE Candidates ",
             "switch": " SWITCH Candidates ",
+            "override": " OVERRIDE Candidates ",
+            "cancel": " CANCEL Candidates ",
             "approve": " APPROVE Candidates ",
             "deny": " DENY Candidates ",
             "session_run_history": " SESSION /RUN History ",
@@ -716,6 +754,8 @@ class ParagentsTUI:
             "slash": "",
             "close": "/close ",
             "switch": "/switch ",
+            "override": "/override ",
+            "cancel": "/cancel ",
             "approve": "/approve ",
             "deny": "/deny ",
             "session_run_history": "",
@@ -1066,6 +1106,7 @@ class ParagentsTUI:
         text = self._log_panel_text()
         fragments: list[tuple[str, str]] = []
         approval_active = self._is_current_panel_task_waiting_approval()
+        conflict_active = self._is_current_panel_task_waiting_conflict_decision()
         active_ref = self._current_pending_request_ref().lower()
         text_lines = text.splitlines()
         for idx, line in enumerate(text_lines):
@@ -1081,6 +1122,12 @@ class ParagentsTUI:
                 fragments.append(("class:status.approval", line + "\n"))
             elif ("[x failed]" in lower or "failed:" in lower) and self._blink_on:
                 fragments.append(("class:status.failed", line + "\n"))
+            elif (
+                conflict_active
+                and ("[! conflict]" in lower or "conflict decision pending" in lower)
+                and self._blink_on
+            ):
+                fragments.append(("class:status.conflict", line + "\n"))
             elif ("[! paused]" in lower or " paused" in lower) and self._blink_on:
                 fragments.append(("class:status.paused", line + "\n"))
             else:
@@ -1115,6 +1162,18 @@ class ParagentsTUI:
         if not request_id:
             return ""
         return self._request_ref(request_id)
+
+    def _is_current_panel_task_waiting_conflict_decision(self) -> bool:
+        task_id = self.log_view_task_id or self.foreground_task_id
+        if not task_id:
+            return False
+        task = self.scheduler.prompts.get(task_id)
+        if task is None:
+            return False
+        local_state = getattr(task, "local_state", {})
+        return bool(local_state.get("preflight_decision_required", False)) and not bool(
+            local_state.get("preflight_user_override", False)
+        )
 
     def _extract_task_short_id(self, line: str) -> str | None:
         m = re.search(r"assistant\(([0-9a-f]{6})\)", line)
@@ -1244,6 +1303,12 @@ class ParagentsTUI:
             self._watch_phase_by_task[task_id] = "waiting approval..."
             self._pending_approval_by_task[task_id] = self._request_ref(request_id)
             return
+        if "conflict decision pending" in line or "serialize conflicts" in line:
+            self._append_main_log(
+                self._format_par(f"[! CONFLICT] assistant({self._task_ref(task_id)}): {self._strip_timestamp(line)}")
+            )
+            self._watch_phase_by_task[task_id] = "waiting conflict decision..."
+            return
         if "paused" in line and "approval" not in line.lower():
             self._append_main_log(self._format_par(f"[! PAUSED] {line}"))
             return
@@ -1252,9 +1317,15 @@ class ParagentsTUI:
     def _strip_timestamp(self, line: str) -> str:
         return re.sub(r"^\[\d{2}:\d{2}:\d{2}\]\s*", "", line).strip()
 
+    def _extract_timestamp(self, line: str) -> str | None:
+        match = re.match(r"^\[(\d{2}:\d{2}:\d{2})\]\s*", line)
+        if not match:
+            return None
+        return match.group(1)
+
     def _with_timestamp(self, line: str) -> str:
         content = self._strip_timestamp(line)
-        ts = time.strftime("%H:%M:%S")
+        ts = self._extract_timestamp(line) or time.strftime("%H:%M:%S")
         return f"[{ts}] {content}"
 
     def _format_you(self, line: str) -> str:
@@ -1355,13 +1426,21 @@ class ParagentsTUI:
             return "triple"
         return "quad"
 
-    def _attention_marker(self, status: str, latest_log: str, pending_request_id: str = "") -> tuple[str, str]:
+    def _attention_marker(
+        self,
+        status: str,
+        latest_log: str,
+        pending_request_id: str = "",
+        has_conflict_pending: bool = False,
+    ) -> tuple[str, str]:
         lower = latest_log.lower()
         # Status should be the source of truth; logs are only hints.
         if status in {"failed", "cancelled"}:
             return ("[X FAILED]", "class:status.failed" if self._blink_on else "")
         if status == "completed":
             return ("[✓ complete]", "class:status.completed_ack" if self._blink_on else "")
+        if has_conflict_pending:
+            return ("[! CONFLICT]", "class:status.conflict" if self._blink_on else "")
         if status == "paused":
             if self._is_request_still_pending(pending_request_id):
                 return ("[! APPROVAL]", "class:status.approval" if self._blink_on else "")
@@ -1386,9 +1465,13 @@ class ParagentsTUI:
         if idx >= len(views):
             return "Submit\n(no task)"
         v = views[idx]
-        marker, _ = self._attention_marker(v.status, v.latest_log, v.pending_approval_request_id)
-        layout_hint = self._submit_panel_layout_hint(len(views), idx)
         task_obj = self.scheduler.prompts.get(v.task_id)
+        local_state = getattr(task_obj, "local_state", {}) if task_obj is not None else {}
+        has_conflict_pending = bool(local_state.get("preflight_decision_required", False)) and not bool(
+            local_state.get("preflight_user_override", False)
+        )
+        marker, _ = self._attention_marker(v.status, v.latest_log, v.pending_approval_request_id, has_conflict_pending)
+        layout_hint = self._submit_panel_layout_hint(len(views), idx)
         initial = str(getattr(task_obj, "local_state", {}).get("initial_input", "")) if task_obj is not None else ""
         task_name = initial or (task_obj.input if task_obj is not None else "")
         task_name = task_name.strip().replace("\n", " ")
@@ -1430,7 +1513,12 @@ class ParagentsTUI:
         if idx >= len(views):
             return [("", "Submit\n(no task)")]
         v = views[idx]
-        _, style = self._attention_marker(v.status, v.latest_log, v.pending_approval_request_id)
+        task_obj = self.scheduler.prompts.get(v.task_id)
+        local_state = getattr(task_obj, "local_state", {}) if task_obj is not None else {}
+        has_conflict_pending = bool(local_state.get("preflight_decision_required", False)) and not bool(
+            local_state.get("preflight_user_override", False)
+        )
+        _, style = self._attention_marker(v.status, v.latest_log, v.pending_approval_request_id, has_conflict_pending)
         text = self._submit_panel_text(idx)
         lines = text.splitlines()
         fragments: list[tuple[str, str]] = []

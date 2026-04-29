@@ -39,6 +39,13 @@ class _FakeScheduler:
         prompt = self.prompts.get(prompt_id)
         return str(getattr(prompt, "session_id", "")).strip() or None
 
+    def get_session_task_ids(self, session_id: str) -> list[str]:
+        out: list[str] = []
+        for task_id, prompt in self.prompts.items():
+            if str(getattr(prompt, "session_id", "")).strip() == session_id:
+                out.append(task_id)
+        return sorted(out)
+
 
 def test_build_tui_layout_has_required_regions() -> None:
     layout = build_tui_layout(submit_count_provider=lambda: 0)
@@ -281,6 +288,71 @@ def test_show_prefix_popup_contains_running_and_unacked_completed() -> None:
     tui._refresh_context_popup()
     assert tui.context_popup_mode == "switch"
     assert {token for token, _ in tui.context_candidates} == {"bbbbbb", "cccccc"}
+
+
+def test_switch_candidates_exclude_current_session() -> None:
+    async def _handler(_: str) -> list[str]:
+        return []
+
+    scheduler = _FakeScheduler()
+    current = Task(task_id="aaaaaa111111", input="x", status="running", task_ref="aa11aa", session_id="sess-current")
+    other = Task(task_id="bbbbbb222222", input="x", status="running", task_ref="bb22bb", session_id="sess-other")
+    scheduler.tasks = {current.task_id: current, other.task_id: other}
+    scheduler.logs_by_task[current.task_id] = ["run"]
+    scheduler.logs_by_task[other.task_id] = ["run"]
+    tui = ParagentsTUI(
+        scheduler=scheduler,  # type: ignore[arg-type]
+        pending_approvals_provider=lambda: 0,
+        command_handler=_handler,
+        show_candidate_task_ids_provider=lambda: [current.task_id, other.task_id],
+        foreground_task_id_provider=lambda: current.task_id,
+    )
+    tui.show_welcome = False
+    tui._refresh_external_state()
+    tui.input_buffer.text = "/switch"
+    tui._refresh_context_popup()
+    assert tui.context_popup_mode == "switch"
+    assert {token for token, _ in tui.context_candidates} == {"sess-o"}
+
+
+def test_override_and_cancel_popup_show_conflict_prompts_in_current_session() -> None:
+    async def _handler(_: str) -> list[str]:
+        return []
+
+    scheduler = _FakeScheduler()
+    conflict = Task(task_id="cccccc333333", input="python a.py > out.txt", status="pending", task_ref="cc33cc", session_id="sess-1")
+    conflict.local_state["preflight_decision_required"] = True
+    conflict.local_state["preflight_user_override"] = False
+    normal = Task(task_id="dddddd444444", input="python b.py", status="pending", task_ref="dd44dd", session_id="sess-1")
+    other_session = Task(task_id="eeeeee555555", input="python c.py > out.txt", status="pending", task_ref="ee55ee", session_id="sess-2")
+    other_session.local_state["preflight_decision_required"] = True
+    scheduler.tasks = {conflict.task_id: conflict, normal.task_id: normal, other_session.task_id: other_session}
+    scheduler.logs_by_task[conflict.task_id] = ["pending"]
+    scheduler.logs_by_task[normal.task_id] = ["pending"]
+    scheduler.logs_by_task[other_session.task_id] = ["pending"]
+
+    tui = ParagentsTUI(
+        scheduler=scheduler,  # type: ignore[arg-type]
+        pending_approvals_provider=lambda: 0,
+        command_handler=_handler,
+        foreground_task_id_provider=lambda: conflict.task_id,
+    )
+    tui.show_welcome = False
+    tui._refresh_external_state()
+
+    tui.input_buffer.text = "/override"
+    tui._refresh_context_popup()
+    assert tui.context_popup_mode == "override"
+    assert tui.context_candidates == [("cc33cc", "cc33cc python a.py > out.txt")]
+    tui._apply_context_selection()
+    assert tui.input_buffer.text == "/override cc33cc"
+
+    tui.input_buffer.text = "/cancel"
+    tui._refresh_context_popup()
+    assert tui.context_popup_mode == "cancel"
+    assert tui.context_candidates == [("cc33cc", "cc33cc python a.py > out.txt")]
+    tui._apply_context_selection()
+    assert tui.input_buffer.text == "/cancel cc33cc"
 
 
 def test_context_popup_height_matches_candidates() -> None:
