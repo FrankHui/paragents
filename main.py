@@ -77,6 +77,7 @@ def _print_help() -> None:
     print("  /list                 List sessions")
     print("  /switch <session_id>  切换 foreground 到指定会话")
     print("  /close <session_id>   通知会话结束并释放槽位")
+    print("  /override <session_id> 冲突时继续执行（可能覆盖输出）")
     print("  /cancel <task_id>     Cancel task（task 级）")
     print("  /pause <task_id>      Pause task（task 级）")
     print("  /resume <session_id>  Resume paused session")
@@ -754,6 +755,7 @@ async def _run_tui_mode() -> None:
             "switch",
             "resume ",
             "close ",
+            "override ",
             "approvals",
             "approve ",
             "deny ",
@@ -790,6 +792,24 @@ async def _run_tui_mode() -> None:
                 foreground_prompt_id = None
                 log_prompt_id = None
             return [f"已 close 会话 {_session_ref(scheduler, target_session_id)}，已释放槽位。"]
+        if cmd.startswith("override "):
+            raw_id = cmd.split(" ", 1)[1].strip()
+            target_session_id = _resolve_slot_session_id(raw_id)
+            if target_session_id is None:
+                prompt_id, _ = _resolve_prompt_id(raw_id, scheduler.prompts)
+                if prompt_id is not None:
+                    target_session_id = scheduler.get_prompt_session_id(prompt_id)
+            if target_session_id is None:
+                return [f"未找到可 override 的会话: {raw_id}"]
+            active_prompt_id = scheduler.get_session_active_task_id(target_session_id)
+            if active_prompt_id is None:
+                return [f"会话 {_session_ref(scheduler, target_session_id)} 当前无可执行 prompt。"]
+            prompt = scheduler.prompts.get(active_prompt_id)
+            if prompt is None:
+                return [f"会话 {_session_ref(scheduler, target_session_id)} 当前无可执行 prompt。"]
+            prompt.local_state["preflight_user_override"] = True
+            prompt.touch()
+            return [f"已允许会话 {_session_ref(scheduler, target_session_id)} 继续执行（可能覆盖输出）。"]
         finish_indices = _parse_finish_indices(cmd.replace("close", "finish", 1))
         if finish_indices:
             _refresh_task_state()
@@ -837,7 +857,18 @@ async def _run_tui_mode() -> None:
             foreground_prompt_id = task_id
             log_prompt_id = None
             pending_run_request_id = None
-            return [f"submitted session: {_session_ref(scheduler, session_id)} (foreground)"]
+            out = [f"submitted session: {_session_ref(scheduler, session_id)} (foreground)"]
+            conflict_sessions = list(scheduler.prompts[task_id].local_state.get("preflight_conflict_with_sessions", []))
+            if conflict_sessions:
+                conflict_refs = ", ".join(_session_ref(scheduler, sid) for sid in conflict_sessions)
+                out.extend(
+                    [
+                        f"检测到输出冲突，默认 serialize 等待会话: {conflict_refs}",
+                        f"取消本次prompt: /cancel {_prompt_ref(scheduler.prompts, task_id)}",
+                        f"继续（可能覆盖）: /override {_session_ref(scheduler, session_id)}",
+                    ]
+                )
+            return out
 
         run_content = _parse_run(cmd)
         if run_content is not None:
@@ -868,6 +899,16 @@ async def _run_tui_mode() -> None:
             if session_id not in session_slots:
                 session_slots.append(session_id)
             out.append("submitted session: " + _session_ref(scheduler, session_id) + " (background)")
+            conflict_sessions = list(scheduler.prompts[task_id].local_state.get("preflight_conflict_with_sessions", []))
+            if conflict_sessions:
+                conflict_refs = ", ".join(_session_ref(scheduler, sid) for sid in conflict_sessions)
+                out.extend(
+                    [
+                        f"检测到输出冲突，默认 serialize 等待会话: {conflict_refs}",
+                        f"取消本次prompt: /cancel {_prompt_ref(scheduler.prompts, task_id)}",
+                        f"继续（可能覆盖）: /override {_session_ref(scheduler, session_id)}",
+                    ]
+                )
             return out
         if cmd == "list" or cmd.startswith("list "):
             if not scheduler.prompts:

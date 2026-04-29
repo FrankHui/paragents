@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import re
+import shlex
 import time
 import uuid
 from pathlib import Path
@@ -28,6 +30,9 @@ class Scheduler:
         self._session_root_task: dict[str, str] = {}
         self._session_refs: dict[str, str] = {}
         self._session_preflight_resources: dict[str, set[str]] = {}
+        self._session_declared_outputs: dict[str, set[str]] = {}
+        self._session_observed_outputs: dict[str, set[str]] = {}
+        self._output_locks: dict[str, str] = {}
         self._running: dict[str, asyncio.Task[None]] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
         self._pause_events: dict[str, asyncio.Event] = {}
@@ -105,6 +110,8 @@ class Scheduler:
     def _extract_resource_keys(self, text: str) -> set[str]:
         lowered = text.lower()
         keys: set[str] = set()
+        for output_path in self._extract_output_paths(text):
+            keys.add(f"out:{output_path}")
         for match in set(Path(part).name for part in text.split() if "." in part and "/" not in part):
             if match:
                 keys.add(f"file:{match}")
@@ -114,16 +121,74 @@ class Scheduler:
             keys.add("git:commit")
         return keys
 
-    def _preflight_conflicts(self, session_id: str, resource_keys: set[str]) -> list[str]:
+    def _extract_output_paths(self, text: str) -> set[str]:
+        outputs: set[str] = set()
+        tokens = self._safe_split(text)
+        for match in re.findall(r"(?:^|\s)(?:>>|>)\s*([^\s|;&]+)", text):
+            normalized = self._normalize_output_key(match)
+            if normalized:
+                outputs.add(normalized)
+        for idx, token in enumerate(tokens):
+            if token != "tee":
+                continue
+            cursor = idx + 1
+            while cursor < len(tokens) and tokens[cursor].startswith("-"):
+                cursor += 1
+            if cursor < len(tokens):
+                normalized = self._normalize_output_key(tokens[cursor])
+                if normalized:
+                    outputs.add(normalized)
+        write_verbs = {"touch", "mkdir", "cp", "mv"}
+        for idx, token in enumerate(tokens):
+            if token not in write_verbs or idx + 1 >= len(tokens):
+                continue
+            if token == "mkdir" and tokens[idx + 1] in {"-p", "-v"} and idx + 2 < len(tokens):
+                normalized_mkdir = self._normalize_output_key(tokens[idx + 2])
+                if normalized_mkdir:
+                    outputs.add(normalized_mkdir)
+                continue
+            if token in {"cp", "mv"} and idx + 2 < len(tokens):
+                cursor = idx + 1
+                while cursor < len(tokens) and tokens[cursor].startswith("-"):
+                    cursor += 1
+                if cursor + 1 < len(tokens):
+                    normalized_dst = self._normalize_output_key(tokens[cursor + 1])
+                    if normalized_dst:
+                        outputs.add(normalized_dst)
+                continue
+            normalized = self._normalize_output_key(tokens[idx + 1])
+            if normalized:
+                outputs.add(normalized)
+        return outputs
+
+    def _safe_split(self, text: str) -> list[str]:
+        try:
+            return [tok.strip().lower() for tok in shlex.split(text) if tok.strip()]
+        except ValueError:
+            return [tok.strip().lower() for tok in text.split() if tok.strip()]
+
+    def _normalize_output_key(self, raw: str) -> str:
+        text = raw.strip().strip("'\"").rstrip(",;")
+        if not text:
+            return ""
+        output = Path(text).as_posix()
+        if output.startswith("./"):
+            output = output[2:]
+        return output
+
+    def _preflight_conflicts(self, session_id: str, resource_keys: set[str]) -> tuple[list[str], dict[str, list[str]]]:
         if not resource_keys:
-            return []
+            return [], {}
         conflicts: list[str] = []
+        details: dict[str, list[str]] = {}
         for other_session, other_keys in self._session_preflight_resources.items():
             if other_session == session_id:
                 continue
-            if resource_keys.intersection(other_keys):
+            overlap = sorted(resource_keys.intersection(other_keys))
+            if overlap:
                 conflicts.append(other_session)
-        return conflicts
+                details[other_session] = overlap
+        return conflicts, details
 
     async def schedule_task_in(self, delay_s: float, user_input: str, tools: dict[str, Any]) -> str:
         scheduled_id = str(uuid.uuid4())
@@ -202,7 +267,8 @@ class Scheduler:
             status="pending",
         )
         preflight_keys = self._extract_resource_keys(user_input)
-        conflict_sessions = self._preflight_conflicts(session_id, preflight_keys)
+        conflict_sessions, conflict_details = self._preflight_conflicts(session_id, preflight_keys)
+        declared_outputs = sorted(key[4:] for key in preflight_keys if key.startswith("out:"))
         prompt.local_state = {
             **prompt.local_state,
             "run_dir": prompt.run_dir,
@@ -210,7 +276,10 @@ class Scheduler:
             "session_ref": session_ref,
             "preflight_resource_keys": sorted(preflight_keys),
             "preflight_conflict_with_sessions": conflict_sessions,
+            "preflight_conflict_keys_by_session": conflict_details,
+            "preflight_declared_outputs": declared_outputs,
             "preflight_decision": "serialize" if conflict_sessions else "allow",
+            "preflight_user_override": False,
         }
         prompt.local_state.setdefault("initial_input", user_input)
         self._prompts[task_id] = prompt
@@ -219,6 +288,7 @@ class Scheduler:
         self._session_tasks.setdefault(session_id, set()).add(task_id)
         self._session_root_task.setdefault(session_id, task_id)
         self._session_preflight_resources.setdefault(session_id, set()).update(preflight_keys)
+        self._session_declared_outputs.setdefault(session_id, set()).update(declared_outputs)
         self._publish_log(task_id, "submitted")
         await self._pending_queue.put(task_id)
         return task_id
@@ -314,7 +384,9 @@ class Scheduler:
 
             session_id = self._task_to_session.get(task_id)
             blockers = set(prompt.local_state.get("preflight_conflict_with_sessions", []))
-            if session_id and blockers:
+            declared_outputs = list(prompt.local_state.get("preflight_declared_outputs", []))
+            allow_override = bool(prompt.local_state.get("preflight_user_override", False))
+            if session_id and blockers and not allow_override:
                 blocking = False
                 for other_task_id, other_task in self._prompts.items():
                     other_session_id = self._task_to_session.get(other_task_id)
@@ -328,6 +400,22 @@ class Scheduler:
                     await self._pending_queue.put(task_id)
                     await asyncio.sleep(0.05)
                     continue
+            acquired_outputs: list[str] = []
+            if session_id and declared_outputs and not allow_override:
+                locked_by_other = False
+                for output_key in declared_outputs:
+                    holder = self._output_locks.get(output_key)
+                    if holder is not None and holder != session_id:
+                        locked_by_other = True
+                        break
+                if locked_by_other:
+                    await self._pending_queue.put(task_id)
+                    await asyncio.sleep(0.05)
+                    continue
+                for output_key in declared_outputs:
+                    if output_key not in self._output_locks:
+                        self._output_locks[output_key] = session_id
+                        acquired_outputs.append(output_key)
 
             prompt.status = "running"
             prompt.touch()
@@ -364,6 +452,12 @@ class Scheduler:
                 prompt.status = "failed"
                 prompt.error = "llm client is unavailable"
                 self._publish_log(task_id, "failed: llm client is unavailable")
+                for output_key in acquired_outputs:
+                    holder = self._output_locks.get(output_key)
+                    if holder == session_id:
+                        self._output_locks.pop(output_key, None)
+                self._cancel_events.pop(task_id, None)
+                self._pause_events.pop(task_id, None)
                 continue
 
             agent = AgentInstance(
@@ -378,8 +472,12 @@ class Scheduler:
         prompt = self._prompts[task_id]
         cancel_event = self._cancel_events[task_id]
         pause_event = self._pause_events[task_id]
+        session_id = self._task_to_session.get(task_id)
         try:
             await agent.run(cancel_event=cancel_event, pause_event=pause_event)
+            declared_outputs = list(prompt.local_state.get("preflight_declared_outputs", []))
+            if session_id and declared_outputs:
+                self._session_observed_outputs.setdefault(session_id, set()).update(declared_outputs)
             if prompt.status == "completed":
                 result_text = "" if prompt.result is None else str(prompt.result)
                 if result_text:
@@ -394,4 +492,10 @@ class Scheduler:
             prompt.touch()
             self._publish_log(task_id, f"failed: {exc}")
         finally:
+            declared_outputs = list(prompt.local_state.get("preflight_declared_outputs", []))
+            if session_id and declared_outputs:
+                for output_key in declared_outputs:
+                    holder = self._output_locks.get(output_key)
+                    if holder == session_id:
+                        self._output_locks.pop(output_key, None)
             self._running.pop(task_id, None)
