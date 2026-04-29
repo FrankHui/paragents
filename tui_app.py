@@ -450,18 +450,37 @@ class ParagentsTUI:
     def _style(self) -> Style:
         return Style.from_dict(
             {
-                "": "bg:#0b1020 #c7d2fe",
-                "root": "bg:#0b1020 #c7d2fe",
-                "panel.main": "bg:#0b1020 #c7d2fe",
-                "panel.command": "bg:#070b16 #dbe4ff",
-                "panel.popup": "bg:#1a1436 #f5ddff",
-                "separator": "bg:#0b1020 #3b82f6",
-                "hint.scroll": "bg:#08121f #67e8f9 bold",
-                "status.approval": "fg:#fbbf24 bold",
-                "status.conflict": "fg:#fb7185 bold",
-                "status.paused": "fg:#f59e0b",
-                "status.failed": "fg:#ef4444 bold",
-                "status.completed_ack": "fg:#22d3ee bold",
+                "": "bg:#0b1020 #c0caf5",
+                "root": "bg:#0b1020 #c0caf5",
+                "panel.main": "bg:#0b1020 #c0caf5",
+                "panel.command": "bg:#0a0f1a #dbe4ff",
+                "panel.popup": "bg:#11172a #c0caf5",
+                "separator": "bg:#0b1020 #3b4261",
+                "hint.scroll": "fg:#7aa2f7",
+                # Semantic log classes.
+                "log.meta": "fg:#565f89",
+                "log.user": "fg:#9ece6a",
+                "log.agent": "fg:#7dcfff",
+                "log.state": "fg:#7aa2f7",
+                "log.approval": "fg:#e0af68 bold",
+                "log.conflict": "fg:#f7768e bold",
+                "log.paused": "fg:#bb9af7 bold",
+                "log.failed": "fg:#db4b4b bold",
+                "log.error": "fg:#ff5f87 bold",
+                # Submit panel badge classes.
+                "badge.running": "fg:#7aa2f7 bold",
+                "badge.pending": "fg:#7aa2f7",
+                "badge.approval": "fg:#e0af68 bold",
+                "badge.conflict": "fg:#f7768e bold",
+                "badge.paused": "fg:#bb9af7 bold",
+                "badge.failed": "fg:#db4b4b bold",
+                "badge.done": "fg:#73daca bold",
+                # Backward-compat aliases for existing branches.
+                "status.approval": "fg:#e0af68 bold",
+                "status.conflict": "fg:#f7768e bold",
+                "status.paused": "fg:#bb9af7 bold",
+                "status.failed": "fg:#db4b4b bold",
+                "status.completed_ack": "fg:#73daca bold",
             }
         )
 
@@ -1110,31 +1129,68 @@ class ParagentsTUI:
         active_ref = self._current_pending_request_ref().lower()
         text_lines = text.splitlines()
         for idx, line in enumerate(text_lines):
-            lower = line.lower()
-            window_lower = "\n".join(text_lines[max(0, idx - 2) : idx + 3]).lower()
-            if (
-                approval_active
-                and active_ref
-                and active_ref in window_lower
-                and ("approval" in lower or "request_id=" in lower or active_ref in lower)
-                and self._blink_on
-            ):
-                fragments.append(("class:status.approval", line + "\n"))
-            elif ("[x failed]" in lower or "failed:" in lower) and self._blink_on:
-                fragments.append(("class:status.failed", line + "\n"))
-            elif (
-                conflict_active
-                and ("[! conflict]" in lower or "conflict decision pending" in lower)
-                and self._blink_on
-            ):
-                fragments.append(("class:status.conflict", line + "\n"))
-            elif ("[! paused]" in lower or " paused" in lower) and self._blink_on:
-                fragments.append(("class:status.paused", line + "\n"))
-            else:
-                fragments.append(("", line + "\n"))
+            style = self._classify_log_line(
+                line=line,
+                idx=idx,
+                text_lines=text_lines,
+                approval_active=approval_active,
+                conflict_active=conflict_active,
+                active_ref=active_ref,
+            )
+            fragments.append((style, line + "\n"))
         if not fragments:
             fragments.append(("", ""))
         return fragments
+
+    def _classify_log_line(
+        self,
+        *,
+        line: str,
+        idx: int,
+        text_lines: list[str],
+        approval_active: bool,
+        conflict_active: bool,
+        active_ref: str,
+    ) -> str:
+        lower = line.lower()
+        window_lower = "\n".join(text_lines[max(0, idx - 2) : idx + 3]).lower()
+
+        if "you:" in lower:
+            return "class:log.user"
+        if "par:" in lower or "assistant(" in lower:
+            if "[x failed]" in lower or "failed:" in lower:
+                return "class:status.failed"
+            if "[! approval]" in lower:
+                return "class:status.approval"
+            if "[! conflict]" in lower:
+                return "class:status.conflict"
+            if "[! paused]" in lower:
+                return "class:status.paused"
+            return "class:log.agent"
+
+        if (
+            approval_active
+            and active_ref
+            and active_ref in window_lower
+            and ("approval" in lower or "request_id=" in lower or active_ref in lower)
+        ):
+            return "class:status.approval"
+        if "[tui error]" in lower:
+            return "class:log.error"
+        if "[x failed]" in lower or "failed:" in lower:
+            return "class:status.failed"
+        if (
+            conflict_active
+            and ("[! conflict]" in lower or "conflict decision pending" in lower)
+        ):
+            return "class:status.conflict"
+        if "[! paused]" in lower or " paused" in lower:
+            return "class:status.paused"
+        if "running" in lower or "pending" in lower or "resumed" in lower:
+            return "class:log.state"
+        if line.startswith("[") and line[3:4] == ":" and line[6:7] == ":":
+            return "class:log.meta"
+        return ""
 
     def _is_current_panel_task_waiting_approval(self) -> bool:
         task_id = self.log_view_task_id or self.foreground_task_id
@@ -1356,15 +1412,15 @@ class ParagentsTUI:
     def _welcome_text(self) -> str:
         return (
             "╔═════════════════════════════════════════════════════════════════════╗\n"
-            "║                    PARAGENTS TUI                                    ║\n"
+            "║                            PARAGENTS TUI                            ║\n"
             "╠═════════════════════════════════════════════════════════════════════╣\n"
-            "║ Welcome. Type command and press Enter.                              ║\n"
+            "║ Type command then Enter.                                            ║\n"
             "║ Capacity: total session slots <= 5                                  ║\n"
-            "║ /switch|/resume -> foreground                                       ║\n"
-            "║ /close <id> is required to release a session slot                   ║\n"
-            "║ Tab complete | Up/Down multiline edit only | Ctrl+R session history ║\n"
+            "║ /switch or /resume -> move to foreground                            ║\n"
+            "║ /close <id> -> release a session slot                               ║\n"
+            "║ Tab complete | Up/Down multiline edit | Ctrl+R session history      ║\n"
             "║ Ctrl+X cancel running prompt | Ctrl+U clear input                   ║\n"
-            "║ Ctrl+C exit | Esc close welcome                                     ║\n"
+            "║ Ctrl+C exit | Esc close this banner                                 ║\n"
             "╚═════════════════════════════════════════════════════════════════════╝"
         )
 
@@ -1382,7 +1438,7 @@ class ParagentsTUI:
         title_right = max(0, inner_width - get_cwidth(title) - title_left)
         lines = [
             f"┌{'─' * title_left}{title}{'─' * title_right}┐",
-            f"│{_pad_display(' Up/Down select  Enter fill  Esc close')}│",
+            f"│{_pad_display(' Up/Down select  Enter apply  Esc close')}│",
             f"├{'─' * inner_width}┤",
         ]
         for idx, (label, _) in enumerate(self.option_items, start=1):
