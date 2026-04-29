@@ -479,7 +479,7 @@ class ParagentsTUI:
     def _scroll_hint_text(self) -> str:
         system = platform.system().lower()
         if system == "darwin":
-            return " Log Scroll: Fn+↑/Fn+↓ | line: Ctrl+K/Ctrl+J | Input: Alt+Enter换行/Ctrl+U清空 | Ctrl+R会话指令 | Ctrl+X取消运行 "
+            return " Log Scroll: Fn+↑/Fn+↓ | line: Ctrl+K/Ctrl+J | Input: Alt+Enter newline/Ctrl+U clear | Ctrl+R session cmds | Ctrl+X cancel "
         return " Log Scroll: PageUp/PageDown | line: Ctrl+K/Ctrl+J | Input: Alt+Enter newline/Ctrl+U clear | Ctrl+R session cmds | Ctrl+X cancel "
 
     def _truncate_to_display_width(self, text: str, max_width: int) -> str:
@@ -729,7 +729,7 @@ class ParagentsTUI:
         title_right = max(0, inner_width - get_cwidth(title) - title_left)
         lines = [
             f"┌{'─' * title_left}{title}{'─' * title_right}┐",
-            f"│{_pad_display(' Up/Down 选择  Enter 回填命令（不执行）')}│",
+            f"│{_pad_display(' Up/Down select  Enter fill command (no execute)')}│",
             f"├{'─' * inner_width}┤",
         ]
         if not self.context_candidates:
@@ -1029,13 +1029,13 @@ class ParagentsTUI:
         self._refresh_external_state()
         prompt_id = self.foreground_task_id
         if not prompt_id:
-            self._append_main_log(self._format_par("当前没有 foreground prompt，可取消操作已忽略。"))
+            self._append_main_log(self._format_par("No foreground prompt. Cancel operation ignored."))
             self._request_redraw()
             return
         prompt = self.scheduler.prompts.get(prompt_id)
         status = str(getattr(prompt, "status", "")) if prompt is not None else ""
         if status not in {"running", "paused"}:
-            self._append_main_log(self._format_par(f"foreground prompt 当前状态为 {status or '(unknown)'}，无需取消。"))
+            self._append_main_log(self._format_par(f"Foreground prompt status is {status or '(unknown)'}, cancel not needed."))
             self._request_redraw()
             return
         bg_task = event.app.create_background_task(self._run_command(f"cancel {prompt_id}"))
@@ -1297,7 +1297,7 @@ class ParagentsTUI:
                 self._append_main_log(self._format_par(f"[! APPROVAL] assistant({self._task_ref(task_id)}): {detail}"))
             self._append_main_log(
                 self._format_par(
-                    f"[! APPROVAL] assistant({self._task_ref(task_id)}): 权限请求 {self._request_ref(request_id)}，输入 y/n 确认"
+                    f"[! APPROVAL] assistant({self._task_ref(task_id)}): approval request {self._request_ref(request_id)}, input y/n to confirm"
                 )
             )
             self._watch_phase_by_task[task_id] = "waiting approval..."
@@ -1355,17 +1355,17 @@ class ParagentsTUI:
 
     def _welcome_text(self) -> str:
         return (
-            "╔══════════════════════════════════════════════════════════╗\n"
-            "║                    PARAGENTS TUI                         ║\n"
-            "╠══════════════════════════════════════════════════════════╣\n"
-            "║ Welcome. Type command and press Enter.                   ║\n"
-            "║ Capacity: total session slots <= 5                       ║\n"
-            "║ /switch|/resume -> foreground                            ║\n"
-            "║ /close <id> is required to release a session slot        ║\n"
-            "║ Tab complete | Up/Down仅多行编辑 | Ctrl+R会话历史命令    ║\n"
-            "║ Ctrl+X 取消运行中prompt | Ctrl+U 清空输入                ║\n"
-            "║ Ctrl+C exit | Esc close welcome                          ║\n"
-            "╚══════════════════════════════════════════════════════════╝"
+            "╔═════════════════════════════════════════════════════════════════════╗\n"
+            "║                    PARAGENTS TUI                                    ║\n"
+            "╠═════════════════════════════════════════════════════════════════════╣\n"
+            "║ Welcome. Type command and press Enter.                              ║\n"
+            "║ Capacity: total session slots <= 5                                  ║\n"
+            "║ /switch|/resume -> foreground                                       ║\n"
+            "║ /close <id> is required to release a session slot                   ║\n"
+            "║ Tab complete | Up/Down multiline edit only | Ctrl+R session history ║\n"
+            "║ Ctrl+X cancel running prompt | Ctrl+U clear input                   ║\n"
+            "║ Ctrl+C exit | Esc close welcome                                     ║\n"
+            "╚═════════════════════════════════════════════════════════════════════╝"
         )
 
     def _options_popup_text(self) -> str:
@@ -1382,7 +1382,7 @@ class ParagentsTUI:
         title_right = max(0, inner_width - get_cwidth(title) - title_left)
         lines = [
             f"┌{'─' * title_left}{title}{'─' * title_right}┐",
-            f"│{_pad_display(' Up/Down 选择  Enter 回填  Esc 关闭')}│",
+            f"│{_pad_display(' Up/Down select  Enter fill  Esc close')}│",
             f"├{'─' * inner_width}┤",
         ]
         for idx, (label, _) in enumerate(self.option_items, start=1):
@@ -1746,9 +1746,9 @@ class ParagentsTUI:
                 self._pending_approval_by_task.pop(self.foreground_task_id, None)
             if output and output[0] == "unknown command":
                 output = [
-                    f"不支持的指令: {effective_cmd}",
-                    "可用命令: /new, /prompt, /submit, /list, /switch, /close, /approvals, /approve, /deny, /pause, /resume, /cancel, /quit",
-                    "提示: 非 / 开头输入会自动按有无 foreground 映射为 /new 或 /prompt。",
+                    f"Unsupported command: {effective_cmd}",
+                    "Available commands: /new, /prompt, /submit, /list, /switch, /close, /approvals, /approve, /deny, /pause, /resume, /cancel, /quit",
+                    "Tip: input without / is auto-mapped to /new or /prompt based on foreground session.",
                 ]
             lines = self._shorten_ids(output if output else ["(no output)"])
             self._trace_render_event(
@@ -1757,7 +1757,7 @@ class ParagentsTUI:
                 output_count=len(lines),
                 first_output_preview=self._truncate_to_display_width((lines[0] if lines else "").replace("\n", "\\n"), 120),
             )
-            if any("槽位已满" in line for line in lines):
+            if any("session slots are full" in line for line in lines):
                 for line in lines:
                     self._push_system_notice(self._format_par(line), ttl=2)
             elif not effective_cmd.startswith("submit "):

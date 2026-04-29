@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import asyncio
 import contextlib
 import readline
@@ -66,22 +65,22 @@ def _request_ref(permission_manager: PermissionManager, request_id: str) -> str:
 
 
 def _print_help() -> None:
-    print("输入模式：")
-    print("  /命令                显式执行命令（例如 /list, /prompt xxx）")
-    print("  普通语句             自动按 /prompt <语句> 处理")
+    print("Input modes:")
+    print("  /command             Run explicit command (e.g. /list, /prompt xxx)")
+    print("  plain text           Auto-mapped to /prompt <text>")
     print("")
-    print("Commands (/前缀):")
-    print("  /new <text>           新建 foreground 会话")
-    print("  /prompt <text>        在当前 foreground 会话上续跑（需会话空闲）")
-    print("  /submit <text>        提交后台任务")
+    print("Commands (/prefix):")
+    print("  /new <text>           Create a new foreground session")
+    print("  /prompt <text>        Continue in current foreground session (must be idle)")
+    print("  /submit <text>        Submit as background session")
     print("  /list                 List sessions")
-    print("  /switch <session_id>  切换 foreground 到指定会话")
-    print("  /close <session_id>   通知会话结束并释放槽位")
-    print("  /override <session_id> 冲突时继续执行（可能覆盖输出）")
-    print("  /cancel <task_id>     Cancel task（task 级）")
-    print("  /pause <task_id>      Pause task（task 级）")
+    print("  /switch <session_id>  Switch foreground to target session")
+    print("  /close <session_id>   Close session and release slot")
+    print("  /override <session_id> Continue on conflict (may overwrite output)")
+    print("  /cancel <task_id>     Cancel task (task-level)")
+    print("  /pause <task_id>      Pause task (task-level)")
     print("  /resume <session_id>  Resume paused session")
-    print("  /retry <task_id>      Retry failed/cancelled task（task 级）")
+    print("  /retry <task_id>      Retry failed/cancelled task (task-level)")
     print("  /schedule <sec> <text> Schedule a delayed task")
     print("  /schedules            List scheduled tasks")
     print("  /cancel-schedule <id> Cancel a scheduled task")
@@ -93,15 +92,15 @@ def _print_help() -> None:
     print("  /permissions          Show active permission config")
     print("  /quit                 Exit")
     print("")
-    print("运行模型：")
-    print("  总槽位最多 5 个（按会话计数，单会话可包含多个子任务）")
-    print("  非 / 开头输入默认按 /prompt <text> 处理")
+    print("Runtime model:")
+    print("  Max 5 total slots (counted by session; one session may contain multiple prompts)")
+    print("  Input without / is auto-mapped to /prompt <text>")
     print("")
-    print("审批提示：")
-    print("  /prompt 触发审批时，可直接输入 y/n + 回车确认。")
-    print("  submit 模式保持 request_id 手动 approve/deny。")
+    print("Approval tips:")
+    print("  When /prompt triggers approval, type y/n then Enter to confirm.")
+    print("  In submit mode, keep request_id and approve/deny manually.")
     print("")
-    print("兼容别名: :h :a :p :s <text> :sv <text>")
+    print("Alias shortcuts: :h :a :p :s <text> :sv <text>")
 
 
 def _normalize_user_input(raw: str) -> str:
@@ -152,7 +151,7 @@ async def _watch_prompt_logs(scheduler: Scheduler, prompt_id: str, replay: bool 
             print(f"[watch:{short_prompt_id}] {colorize_watch_line(line)}")
     queue = scheduler.subscribe_task_logs(prompt_id)
     try:
-        print(f"[watch:{short_prompt_id}] live watch started (输入 h 或 hide 隐藏)")
+        print(f"[watch:{short_prompt_id}] live watch started (type h or hide to hide)")
         while True:
             line = await queue.get()
             print(f"[watch:{short_prompt_id}] {colorize_watch_line(line)}")
@@ -167,11 +166,11 @@ async def _run_initial_setup_if_needed() -> None:
     settings = load_runtime_settings()
     if settings is not None:
         return
-    print(f"未检测到配置文件：{get_runtime_config_path()}")
-    print("首次启动需要配置 LLM。")
+    print(f"Config file not found: {get_runtime_config_path()}")
+    print("First startup requires LLM setup.")
     new_settings = await asyncio.to_thread(build_interactive_settings, None)
     await asyncio.to_thread(save_runtime_settings, new_settings)
-    print(f"配置已保存到：{get_runtime_config_path()}")
+    print(f"Config saved to: {get_runtime_config_path()}")
 
 
 async def _run_cli() -> None:
@@ -375,13 +374,13 @@ async def _run_cli() -> None:
             scheduler.set_llm_client(
                 LLMClient(max_concurrency=16, timeout_s=20, max_retries=2, runtime_settings=new_settings)
             )
-            print(f"配置已更新：{get_runtime_config_path()}")
+            print(f"Config updated: {get_runtime_config_path()}")
             continue
 
         if cmd == "show-config":
             current = load_runtime_settings()
             if current is None:
-                print(f"未找到配置文件：{get_runtime_config_path()}")
+                print(f"Config file not found: {get_runtime_config_path()}")
             else:
                 print(f"path={get_runtime_config_path()}")
                 print(f"default_provider={current.default_provider}")
@@ -617,17 +616,17 @@ async def _handle_run_approval_answer(
             failed_short = ", ".join(_prompt_ref(scheduler.prompts, t) for t in failed)
             return [f"denied {short_id}", f"failed sessions: {failed_short}"]
         return [f"denied {short_id}"]
-    return ["请输入 y 或 n"]
+    return ["please input y or n"]
 
 
 def _approval_prompt_text(permission_manager: PermissionManager, request_id: str) -> str:
     req = permission_manager.get_pending(request_id)
     if req is None:
-        return f"assistant: 权限请求 {_request_ref(permission_manager, request_id)}，是否同意？[y/n]"
+        return f"assistant: approval request {_request_ref(permission_manager, request_id)}, allow? [y/n]"
     rendered = format_approval_request(req)
     if "|" in rendered:
         rendered = rendered.split("|", 1)[1].strip()
-    return f"assistant: 权限请求 {_request_ref(permission_manager, request_id)} | {rendered} | 是否同意？[y/n]"
+    return f"assistant: approval request {_request_ref(permission_manager, request_id)} | {rendered} | allow? [y/n]"
 
 
 async def _resume_tasks_waiting_for_approval(scheduler: Scheduler, request_id: str) -> list[str]:
@@ -711,12 +710,12 @@ async def _run_tui_mode() -> None:
 
     def _close_prompt_lines() -> list[str]:
         if not session_slots:
-            return ["当前没有可 close 的会话。"]
-        lines = ["可 close 会话："]
+            return ["no sessions available to close."]
+        lines = ["Closable sessions:"]
         for idx, session_id in enumerate(session_slots, start=1):
             lines.append(f"{idx}) {_session_ref(scheduler, session_id)} { _session_seed_content(scheduler, session_id, max_len=56)}")
-        lines.append("支持批量输入，例如: 1/2")
-        lines.append("或使用: /close <session_id前6位>")
+        lines.append("Supports batch input, e.g. 1/2")
+        lines.append("Or use: /close <session_ref>")
         return lines
 
     def _resolve_slot_session_id(session_input: str) -> str | None:
@@ -787,7 +786,7 @@ async def _run_tui_mode() -> None:
             target_session_id = _resolve_slot_session_id(raw_task_id)
             if not target_session_id:
                 return [
-                    f"未找到可 close 会话: {raw_task_id}",
+                    f"no closable session found: {raw_task_id}",
                     *_close_prompt_lines(),
                 ]
             finished_session_ids.add(target_session_id)
@@ -796,25 +795,25 @@ async def _run_tui_mode() -> None:
             if foreground_prompt_id and scheduler.get_prompt_session_id(foreground_prompt_id) == target_session_id:
                 foreground_prompt_id = None
                 log_prompt_id = None
-            return [f"已 close 会话 {_session_ref(scheduler, target_session_id)}，已释放槽位。"]
+            return [f"closed session {_session_ref(scheduler, target_session_id)} and released slot."]
         if cmd == "override":
             _refresh_task_state()
             target_prompt_id = foreground_prompt_id
             if target_prompt_id is None:
-                return ["缺少 session_id。用法: /override <session_ref>。当前无 foreground 会话。"]
+                return ["missing session_id. Usage: /override <session_ref>. No foreground session."]
             target_prompt = scheduler.prompts.get(target_prompt_id)
             if target_prompt is None:
-                return ["缺少 session_id。用法: /override <session_ref>。"]
+                return ["missing session_id. Usage: /override <session_ref>."]
             if not bool(getattr(target_prompt, "local_state", {}).get("preflight_decision_required", False)):
-                return ["当前 foreground 会话没有待决冲突，无需 /override。"]
+                return ["no pending conflict in current foreground session, /override not needed."]
             target_session_id = scheduler.get_prompt_session_id(target_prompt_id)
             if not target_session_id:
-                return ["当前 foreground 会话无法解析 session_id，请使用 /override <session_ref>。"]
+                return ["cannot resolve session_id from current foreground session, use /override <session_ref>."]
             target_prompt.local_state["preflight_user_override"] = True
             target_prompt.local_state["preflight_decision_required"] = False
             target_prompt.local_state["preflight_blocking_notice_emitted"] = False
             target_prompt.touch()
-            return [f"已允许会话 {_session_ref(scheduler, target_session_id)} 继续执行（可能覆盖输出）。"]
+            return [f"session {_session_ref(scheduler, target_session_id)} is allowed to continue (output may be overwritten)."]
         if cmd.startswith("override "):
             raw_id = cmd.split(" ", 1)[1].strip()
             target_session_id = _resolve_slot_session_id(raw_id)
@@ -823,23 +822,23 @@ async def _run_tui_mode() -> None:
                 if prompt_id is not None:
                     target_session_id = scheduler.get_prompt_session_id(prompt_id)
             if target_session_id is None:
-                return [f"未找到可 override 的会话: {raw_id}"]
+                return [f"no overridable session found: {raw_id}"]
             active_prompt_id = scheduler.get_session_active_task_id(target_session_id)
             if active_prompt_id is None:
-                return [f"会话 {_session_ref(scheduler, target_session_id)} 当前无可执行 prompt。"]
+                return [f"session {_session_ref(scheduler, target_session_id)} has no executable prompt."]
             prompt = scheduler.prompts.get(active_prompt_id)
             if prompt is None:
-                return [f"会话 {_session_ref(scheduler, target_session_id)} 当前无可执行 prompt。"]
+                return [f"session {_session_ref(scheduler, target_session_id)} has no executable prompt."]
             prompt.local_state["preflight_user_override"] = True
             prompt.local_state["preflight_decision_required"] = False
             prompt.local_state["preflight_blocking_notice_emitted"] = False
             prompt.touch()
-            return [f"已允许会话 {_session_ref(scheduler, target_session_id)} 继续执行（可能覆盖输出）。"]
+            return [f"session {_session_ref(scheduler, target_session_id)} is allowed to continue (output may be overwritten)."]
         finish_indices = _parse_finish_indices(cmd.replace("close", "finish", 1))
         if finish_indices:
             _refresh_task_state()
             if not session_slots:
-                return ["当前没有可 close 的会话。"]
+                return ["no sessions available to close."]
             if max(finish_indices) > len(session_slots):
                 return _close_prompt_lines()
             target_ids = [session_slots[idx - 1] for idx in finish_indices]
@@ -851,7 +850,7 @@ async def _run_tui_mode() -> None:
                     foreground_prompt_id = None
                     log_prompt_id = None
             released = ", ".join(_session_ref(scheduler, session_id) for session_id in target_ids)
-            return [f"已 close 会话 {released}，已释放槽位。"]
+            return [f"closed sessions {released} and released slots."]
         handled, lines = handle_approval_command(cmd, permission_manager)
         if handled:
             out.extend(lines)
@@ -874,7 +873,7 @@ async def _run_tui_mode() -> None:
         if new_content is not None:
             _refresh_task_state()
             if len(session_slots) >= 5:
-                return ["会话槽位已满（最多 5 个），请先 /close 释放后再运行。", *_close_prompt_lines()]
+                return ["session slots are full (max 5). Use /close before continuing.", *_close_prompt_lines()]
             try:
                 task_id = await scheduler.create_session_prompt(new_content, tools=_build_main_tools())
             except ValueError as exc:
@@ -891,9 +890,9 @@ async def _run_tui_mode() -> None:
                 conflict_refs = ", ".join(_session_ref(scheduler, sid) for sid in conflict_sessions)
                 out.extend(
                     [
-                        f"检测到输出冲突（需决策）: {conflict_refs}",
-                        f"取消本次prompt: /cancel {_prompt_ref(scheduler.prompts, task_id)}",
-                        f"继续（可能覆盖）: /override {_session_ref(scheduler, session_id)}",
+                        f"output conflict detected (decision required): {conflict_refs}",
+                        f"cancel this prompt: /cancel {_prompt_ref(scheduler.prompts, task_id)}",
+                        f"continue (may overwrite): /override {_session_ref(scheduler, session_id)}",
                     ]
                 )
             return out
@@ -902,14 +901,14 @@ async def _run_tui_mode() -> None:
         if run_content is not None:
             _refresh_task_state()
             if foreground_prompt_id is None:
-                return ["当前没有 foreground 会话，请使用 /new <text> 新建会话。"]
+                return ["no foreground session. Use /new <text> to create one."]
             fg_task = scheduler.prompts.get(foreground_prompt_id)
             fg_status = str(getattr(fg_task, "status", "")) if fg_task is not None else ""
             if fg_status in {"running", "pending", "paused"}:
-                return [f"foreground 会话 {_prompt_ref(scheduler.prompts, foreground_prompt_id)} 正在执行中，当前不可 /prompt 新序列。"]
+                return [f"foreground session {_prompt_ref(scheduler.prompts, foreground_prompt_id)} is busy; cannot start a new /prompt now."]
             ok = await scheduler.continue_session_prompt(foreground_prompt_id, run_content)
             if not ok:
-                return [f"foreground 会话 {_prompt_ref(scheduler.prompts, foreground_prompt_id)} 当前不可续跑。"]
+                return [f"foreground session {_prompt_ref(scheduler.prompts, foreground_prompt_id)} cannot continue right now."]
             log_prompt_id = None
             pending_run_request_id = None
             out = [f"continued in foreground session: {_prompt_ref(scheduler.prompts, foreground_prompt_id)}"]
@@ -919,9 +918,9 @@ async def _run_tui_mode() -> None:
                 conflict_refs = ", ".join(_session_ref(scheduler, sid) for sid in conflict_sessions)
                 out.extend(
                     [
-                        f"检测到输出冲突（需决策）: {conflict_refs}",
-                        f"取消本次prompt: /cancel {_prompt_ref(scheduler.prompts, foreground_prompt_id)}",
-                        "继续（可能覆盖）: /override <当前session_ref>",
+                        f"output conflict detected (decision required): {conflict_refs}",
+                        f"cancel this prompt: /cancel {_prompt_ref(scheduler.prompts, foreground_prompt_id)}",
+                        "continue (may overwrite): /override <current_session_ref>",
                     ]
                 )
             return out
@@ -933,7 +932,7 @@ async def _run_tui_mode() -> None:
                 return ["submit content is empty"]
             _refresh_task_state()
             if len(session_slots) >= 5:
-                return ["会话槽位已满（最多 5 个），请先 /close 释放后再提交。", *_close_prompt_lines()]
+                return ["session slots are full (max 5). Use /close before submit.", *_close_prompt_lines()]
             try:
                 task_id = await scheduler.create_session_prompt(content, tools=_build_main_tools())
             except ValueError as exc:
@@ -947,9 +946,9 @@ async def _run_tui_mode() -> None:
                 conflict_refs = ", ".join(_session_ref(scheduler, sid) for sid in conflict_sessions)
                 out.extend(
                     [
-                        f"检测到输出冲突（需决策）: {conflict_refs}",
-                        f"取消本次prompt: /cancel {_prompt_ref(scheduler.prompts, task_id)}",
-                        f"继续（可能覆盖）: /override {_session_ref(scheduler, session_id)}",
+                        f"output conflict detected (decision required): {conflict_refs}",
+                        f"cancel this prompt: /cancel {_prompt_ref(scheduler.prompts, task_id)}",
+                        f"continue (may overwrite): /override {_session_ref(scheduler, session_id)}",
                     ]
                 )
             return out
@@ -983,13 +982,13 @@ async def _run_tui_mode() -> None:
                     return [err or "session not found"]
                 session_id = scheduler.get_prompt_session_id(task_id)
             if session_id is None or session_id in finished_session_ids:
-                return [f"会话已 close 并释放，不支持 /switch。"]
+                return ["session is already closed and released; /switch is not available."]
             current_session_id = scheduler.get_prompt_session_id(foreground_prompt_id) if foreground_prompt_id else None
             if current_session_id and session_id == current_session_id:
-                return [f"已经在当前会话 {_session_ref(scheduler, session_id)}。"]
+                return [f"already in current session {_session_ref(scheduler, session_id)}."]
             active_task_id = scheduler.get_session_active_task_id(session_id)
             if active_task_id is None:
-                return [f"会话 {_session_ref(scheduler, session_id)} 当前无可展示任务。"]
+                return [f"session {_session_ref(scheduler, session_id)} has no displayable prompt."]
             foreground_prompt_id = active_task_id
             log_prompt_id = None
             return [f"switched to foreground session: {_session_ref(scheduler, session_id)}"]
@@ -998,7 +997,7 @@ async def _run_tui_mode() -> None:
             return ["cancel signal sent"]
         if cmd == "cancel":
             if foreground_prompt_id is None:
-                return ["缺少 prompt_id。用法: /cancel <prompt_ref>。当前无 foreground 会话。"]
+                return ["missing prompt_id. Usage: /cancel <prompt_ref>. No foreground session."]
             await scheduler.cancel(foreground_prompt_id)
             return [f"cancel signal sent: {_prompt_ref(scheduler.prompts, foreground_prompt_id)}"]
         if cmd.startswith("pause "):
@@ -1014,10 +1013,10 @@ async def _run_tui_mode() -> None:
                     return [err or "session not found"]
                 session_id = scheduler.get_prompt_session_id(task_id)
             if session_id is None or session_id in finished_session_ids:
-                return ["会话已 close，不可 resume。"]
+                return ["session is closed and cannot be resumed."]
             task_id = scheduler.get_session_active_task_id(session_id)
             if task_id is None:
-                return [f"会话 {_session_ref(scheduler, session_id)} 当前无可 resume 任务。"]
+                return [f"session {_session_ref(scheduler, session_id)} has no resumable prompt."]
             await scheduler.resume(task_id)
             foreground_prompt_id = task_id
             log_prompt_id = None
@@ -1067,10 +1066,4 @@ async def _run_tui_mode() -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--ui", choices=["cli", "tui"], default="cli")
-    args = parser.parse_args()
-    if args.ui == "tui":
-        asyncio.run(_run_tui_mode())
-    else:
-        asyncio.run(_run_cli())
+    asyncio.run(_run_tui_mode())

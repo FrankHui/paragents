@@ -238,7 +238,7 @@ def test_approval_detail_line_is_before_confirm_prompt() -> None:
     tui.watch_source = "show"
     _ = tui._log_panel_text()
     detail_idx = next(i for i, line in enumerate(tui.logs) if "type=capability_enable" in line)
-    prompt_idx = next(i for i, line in enumerate(tui.logs) if "输入 y/n 确认" in line)
+    prompt_idx = next(i for i, line in enumerate(tui.logs) if "input y/n to confirm" in line)
     assert detail_idx < prompt_idx
 
 
