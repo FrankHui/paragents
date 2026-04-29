@@ -222,6 +222,83 @@ def test_task_scoped_shell_approval_is_isolated(tmp_path: Path) -> None:
     assert denied_b.allowed is False
 
 
+def test_session_scoped_shell_approval_is_shared_across_prompts(tmp_path: Path) -> None:
+    manager = _build_manager(tmp_path, [FsScope(path=str(tmp_path), read=True, write=True)])
+    decision_a = manager.check_shell_command("python3 --version", prompt_id="prompt-A", session_id="session-1")
+    assert decision_a.allowed is False
+    assert decision_a.request_id
+
+    assert manager.approve(decision_a.request_id, session_id="session-1") is True
+
+    allowed_b = manager.check_shell_command("python3 --version", prompt_id="prompt-B", session_id="session-1")
+    denied_other_session = manager.check_shell_command("python3 --version", prompt_id="prompt-C", session_id="session-2")
+    assert allowed_b.allowed is True
+    assert denied_other_session.allowed is False
+
+
+def test_fs_scope_request_records_owner_session_from_tool(tmp_path: Path) -> None:
+    allowed = tmp_path / "allowed"
+    denied = tmp_path / "denied"
+    allowed.mkdir()
+    denied.mkdir()
+    target = denied / "private.txt"
+    target.write_text("secret", encoding="utf-8")
+
+    manager = _build_manager(tmp_path, [FsScope(path=str(allowed), read=True, write=False)])
+    tools = create_default_tools(manager)
+
+    result = asyncio.run(
+        tools["read_file"](
+            {
+                "path": str(target),
+                "_prompt_id": "prompt-1",
+                "_session_id": "session-1",
+            }
+        )
+    )
+    assert result["ok"] is False
+    assert result["needs_approval"] is True
+    request_id = result["request_id"]
+    req = manager.get_pending(request_id)
+    assert req is not None
+    assert req.owner_prompt_id == "prompt-1"
+    assert req.owner_session_id == "session-1"
+
+
+def test_github_approve_always_persists_after_reload(tmp_path: Path) -> None:
+    cfg = PermissionsConfig(
+        capabilities={
+            "filesystem": True,
+            "shell": False,
+            "python": False,
+            "git": False,
+            "github": True,
+            "web": False,
+            "mcp": False,
+        },
+        fs_scopes=[FsScope(path=str(tmp_path), read=True, write=True)],
+    )
+    manager = PermissionManager(cfg, tmp_path / "permissions.json")
+
+    first = manager.check_github_request("POST", "/repos/acme/repo/issues", session_id="session-1")
+    assert first.allowed is False
+    assert first.request_id
+    assert manager.approve(first.request_id, always=True, session_id="session-1") is True
+
+    config = json.loads((tmp_path / "permissions.json").read_text(encoding="utf-8"))
+    loaded = PermissionsConfig(
+        capabilities=config["capabilities"],
+        fs_scopes=[FsScope(**scope) for scope in config["fs_scopes"]],
+        shell_policy=config["shell_policy"],
+        python_policy=config["python_policy"],
+        git_policy=config["git_policy"],
+        github_policy=config["github_policy"],
+    )
+    reloaded_manager = PermissionManager(loaded, tmp_path / "permissions.json")
+    second = reloaded_manager.check_github_request("POST", "/repos/acme/repo/issues", session_id="another-session")
+    assert second.allowed is True
+
+
 def test_task_run_dir_is_used_by_run_command(tmp_path: Path) -> None:
     manager = _build_manager(tmp_path, [FsScope(path=str(tmp_path), read=True, write=True)])
     tools = create_default_tools(manager)
@@ -239,3 +316,44 @@ def test_task_run_dir_is_used_by_run_command(tmp_path: Path) -> None:
     )
     assert result["ok"] is True
     assert str(run_dir) in result.get("stdout", "")
+
+
+def test_python_route_keeps_scope_and_prompt_run_dir(tmp_path: Path) -> None:
+    manager = _build_manager(tmp_path, [FsScope(path=str(tmp_path), read=True, write=True)])
+    tools = create_default_tools(manager)
+    run_dir = tmp_path / "py-run-dir"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    script = run_dir / "print_cwd.py"
+    script.write_text("import os; print(os.getcwd())", encoding="utf-8")
+
+    first = asyncio.run(
+        tools["run_command"](
+            {
+                "command": f"python3 {script.name}",
+                "_prompt_id": "prompt-1",
+                "_session_id": "session-1",
+                "_prompt_run_dir": str(run_dir),
+            }
+        )
+    )
+    assert first["ok"] is False
+    assert first["needs_approval"] is True
+    request_id = first["request_id"]
+    req = manager.get_pending(request_id)
+    assert req is not None
+    assert req.owner_session_id == "session-1"
+    assert req.owner_prompt_id == "prompt-1"
+
+    assert manager.approve(request_id, always=False, session_id="session-1") is True
+    second = asyncio.run(
+        tools["run_command"](
+            {
+                "command": f"python3 {script.name}",
+                "_prompt_id": "prompt-1",
+                "_session_id": "session-1",
+                "_prompt_run_dir": str(run_dir),
+            }
+        )
+    )
+    assert second["ok"] is True
+    assert str(run_dir) in second.get("stdout", "")

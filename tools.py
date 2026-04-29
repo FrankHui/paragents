@@ -290,7 +290,7 @@ async def read_file_tool(args: dict[str, Any], permission_manager: PermissionMan
 
     try:
         path = Path(raw_path).expanduser().resolve()
-        decision = permission_manager.check_fs_access(str(path), "read")
+        decision = permission_manager.check_fs_access(str(path), "read", prompt_id=prompt_id, session_id=session_id)
         if not decision.allowed:
             return {
                 "ok": False,
@@ -338,7 +338,7 @@ async def list_dir_tool(args: dict[str, Any], permission_manager: PermissionMana
 
     try:
         path = Path(raw_path).expanduser().resolve()
-        decision = permission_manager.check_fs_access(str(path), "read")
+        decision = permission_manager.check_fs_access(str(path), "read", prompt_id=prompt_id, session_id=session_id)
         if not decision.allowed:
             return {
                 "ok": False,
@@ -386,7 +386,7 @@ async def glob_tool(args: dict[str, Any], permission_manager: PermissionManager)
 
     try:
         base_dir = Path(base_dir_raw).expanduser().resolve()
-        decision = permission_manager.check_fs_access(str(base_dir), "read")
+        decision = permission_manager.check_fs_access(str(base_dir), "read", prompt_id=prompt_id, session_id=session_id)
         if not decision.allowed:
             return {
                 "ok": False,
@@ -432,7 +432,7 @@ async def grep_tool(args: dict[str, Any], permission_manager: PermissionManager)
 
     try:
         root = Path(path_raw).expanduser().resolve()
-        decision = permission_manager.check_fs_access(str(root), "read")
+        decision = permission_manager.check_fs_access(str(root), "read", prompt_id=prompt_id, session_id=session_id)
         if not decision.allowed:
             return {
                 "ok": False,
@@ -475,7 +475,14 @@ async def run_command_tool(args: dict[str, Any], permission_manager: PermissionM
     except ValueError:
         tokens = []
     if tokens and tokens[0] in {"python", "python3"}:
-        return await run_python_tool({"command": command, "timeout_s": args.get("timeout_s", 10)}, permission_manager)
+        return await run_python_tool(
+            {
+                **args,
+                "command": command,
+                "timeout_s": args.get("timeout_s", 10),
+            },
+            permission_manager,
+        )
 
     prompt_id = str(args.get("_prompt_id", "")).strip() or None
     session_id = str(args.get("_session_id", "")).strip() or None
