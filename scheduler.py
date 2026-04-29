@@ -11,6 +11,7 @@ from typing import Any
 from agent_instance import AgentInstance
 from id_refs import generate_short_ref
 from llm_client import LLMClient
+from preflight_intent import infer_preflight_intent
 from task import Prompt
 from tools import ToolRegistry
 
@@ -114,6 +115,12 @@ class Scheduler:
             keys.add("git:commit")
         return keys
 
+    def _build_preflight_resource_keys(self, text: str) -> tuple[set[str], dict[str, object]]:
+        intent = infer_preflight_intent(text)
+        keys = self._extract_resource_keys(text)
+        keys.update(intent.to_resource_keys())
+        return keys, intent.to_state()
+
     def _preflight_conflicts(self, session_id: str, resource_keys: set[str]) -> list[str]:
         if not resource_keys:
             return []
@@ -201,13 +208,14 @@ class Scheduler:
             run_dir=str(run_dir),
             status="pending",
         )
-        preflight_keys = self._extract_resource_keys(user_input)
+        preflight_keys, preflight_intent = self._build_preflight_resource_keys(user_input)
         conflict_sessions = self._preflight_conflicts(session_id, preflight_keys)
         prompt.local_state = {
             **prompt.local_state,
             "run_dir": prompt.run_dir,
             "session_id": session_id,
             "session_ref": session_ref,
+            "preflight_intent": preflight_intent,
             "preflight_resource_keys": sorted(preflight_keys),
             "preflight_conflict_with_sessions": conflict_sessions,
             "preflight_decision": "serialize" if conflict_sessions else "allow",
@@ -233,6 +241,13 @@ class Scheduler:
         prompt.input = user_input
         prompt.result = None
         prompt.error = None
+        preflight_keys, preflight_intent = self._build_preflight_resource_keys(user_input)
+        conflict_sessions = self._preflight_conflicts(prompt.session_id, preflight_keys)
+        prompt.local_state["preflight_intent"] = preflight_intent
+        prompt.local_state["preflight_resource_keys"] = sorted(preflight_keys)
+        prompt.local_state["preflight_conflict_with_sessions"] = conflict_sessions
+        prompt.local_state["preflight_decision"] = "serialize" if conflict_sessions else "allow"
+        self._session_preflight_resources.setdefault(prompt.session_id, set()).update(preflight_keys)
         prompt.status = "pending"
         prompt.touch()
         if self._debug_enabled:
@@ -316,11 +331,14 @@ class Scheduler:
             blockers = set(prompt.local_state.get("preflight_conflict_with_sessions", []))
             if session_id and blockers:
                 blocking = False
+                current_keys = set(prompt.local_state.get("preflight_resource_keys", []))
                 for other_task_id, other_task in self._prompts.items():
                     other_session_id = self._task_to_session.get(other_task_id)
+                    other_keys = set(other_task.local_state.get("preflight_resource_keys", []))
                     if (
                         other_session_id in blockers
-                        and other_task.status in {"pending", "running", "paused"}
+                        and other_task.status in {"running", "paused"}
+                        and bool(current_keys.intersection(other_keys))
                     ):
                         blocking = True
                         break
