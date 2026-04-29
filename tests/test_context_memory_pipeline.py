@@ -30,6 +30,19 @@ class _TwoToolThenFinalLLM:
         return {"type": "final", "content": "done"}
 
 
+class _ManyToolThenFinalLLM:
+    def __init__(self, tool_rounds: int = 6) -> None:
+        self._calls = 0
+        self._tool_rounds = tool_rounds
+
+    async def infer(self, messages):  # noqa: ANN001
+        _ = messages
+        self._calls += 1
+        if self._calls <= self._tool_rounds:
+            return {"type": "tool", "tool_name": "run_command", "args": {"command": f"echo hi-{self._calls}"}}
+        return {"type": "final", "content": "done"}
+
+
 async def _ok_tool(args):  # noqa: ANN001
     return {"ok": True, "stdout": "hello", "stderr": ""}
 
@@ -72,3 +85,27 @@ def test_summarize_local_memory_uses_latest_items() -> None:
     summary = summarize_local_memory(items, limit=2)
     assert "a:ok" in summary
     assert "b:non-ok" in summary
+
+
+def test_multi_round_tools_compact_and_memory_snapshot_in_debug(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setenv("PARAGENTS_TUI_DEBUG", "1")
+    events: list[str] = []
+    task = Task(task_id="t-many-tools", input="run")
+    agent = AgentInstance(
+        task=task,
+        llm_client=_ManyToolThenFinalLLM(tool_rounds=6),  # type: ignore[arg-type]
+        tools=ToolRegistry({"run_command": _ok_tool}),
+        event_callback=events.append,
+    )
+    asyncio.run(agent.run(cancel_event=asyncio.Event()))
+
+    assert task.status == "completed"
+    snapshot = task.local_state.get("context_snapshot", {})
+    compact_notes = snapshot.get("compact_notes", [])
+    recent_turns = snapshot.get("recent_turns", [])
+    assert compact_notes
+    assert "run_command:ok" in str(task.local_state.get("memory_summary", ""))
+    assert any("Tool observation for run_command" in turn.get("content", "") for turn in recent_turns)
+    assert any("debug.context.compact_notes=" in line for line in events)
+    assert any("debug.memory_summary=" in line and "run_command:ok" in line for line in events)
+    assert any("debug.context.recent_turns=" in line for line in events)

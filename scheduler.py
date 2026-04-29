@@ -15,6 +15,12 @@ from hook_runtime import HookRuntime
 from id_refs import generate_short_ref
 from llm_client import LLMClient
 from preflight_intent import infer_preflight_intent_with_llm
+from session_runtime import (
+    DefaultCheckpointRecovery,
+    DefaultCompactionEngine,
+    DefaultPromptAssembler,
+    InMemorySessionStateStore,
+)
 from task import Prompt
 from tools import ToolRegistry
 
@@ -46,7 +52,15 @@ class Scheduler:
         self._scheduled_meta: dict[str, float] = {}
         self._runs_root = Path.cwd() / ".paragents" / "runs"
         self._debug_enabled = os.getenv("PARAGENTS_TUI_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+        self._debug_sequential_prompt_ids = (
+            os.getenv("PARAGENTS_DEBUG_SEQUENTIAL_PROMPT_IDS", "").strip().lower() in {"1", "true", "yes", "on"}
+        )
+        self._debug_prompt_seq = 0
         self._hook_runtime = HookRuntime.load_from_path(Path.cwd() / ".paragents" / "hooks.json")
+        self._session_state_store = InMemorySessionStateStore()
+        self._prompt_assembler = DefaultPromptAssembler()
+        self._compaction_engine = DefaultCompactionEngine()
+        self._checkpoint_recovery = DefaultCheckpointRecovery()
 
     @property
     def prompts(self) -> dict[str, Prompt]:
@@ -255,6 +269,47 @@ class Scheduler:
         for queue in self._subscribers.get(task_id, []):
             queue.put_nowait(line)
 
+    def _load_session_runtime_seed(self, session_id: str | None) -> tuple[dict[str, Any], list[Any], str]:
+        if not session_id:
+            return {}, [], ""
+        state = self._session_state_store.load(session_id)
+        snapshot = {
+            "recent_turns": list(state.recent_turns),
+            "compact_notes": list(state.compact_notes),
+        }
+        return snapshot, list(state.memory_items), state.memory_summary
+
+    def _save_session_runtime_delta(
+        self,
+        session_id: str | None,
+        context_snapshot: dict[str, Any],
+        memory_items: list[Any],
+        memory_summary: str,
+    ) -> None:
+        if not session_id:
+            return
+        state = self._session_state_store.merge_turn_delta(
+            session_id,
+            context_snapshot=context_snapshot,
+            memory_items=memory_items,
+            memory_summary=memory_summary,
+        )
+        checkpoint = self._checkpoint_recovery.capture(
+            task_state={},
+            context_snapshot=context_snapshot,
+            memory_summary=memory_summary,
+        )
+        self._session_state_store.save_checkpoint(session_id, checkpoint)
+        active_prompt_id = self.get_session_active_task_id(session_id)
+        if active_prompt_id and active_prompt_id in self._prompts:
+            self._prompts[active_prompt_id].local_state["session_runtime_state"] = state.to_state()
+
+    def _next_prompt_id(self) -> str:
+        if not self._debug_sequential_prompt_ids:
+            return str(uuid.uuid4())
+        self._debug_prompt_seq += 1
+        return f"debug-prompt-{self._debug_prompt_seq:06d}"
+
     async def start(self) -> None:
         if self._dispatch_task is None or self._dispatch_task.done():
             self._dispatch_task = asyncio.create_task(self._dispatch_loop())
@@ -265,7 +320,7 @@ class Scheduler:
         tools: dict[str, Any],
         session_id: str | None = None,
     ) -> str:
-        task_id = str(uuid.uuid4())
+        task_id = self._next_prompt_id()
         session_id = self._resolve_session_id(session_id, task_id)
         session_ref = self._assign_session_ref(session_id)
         existing_refs = {p.prompt_ref for p in self._prompts.values()}
@@ -297,6 +352,7 @@ class Scheduler:
             "preflight_user_override": False,
             "preflight_decision_required": bool(conflict_sessions),
             "preflight_blocking_notice_emitted": False,
+            "session_runtime_state": self._session_state_store.load(session_id).to_state(),
         }
         prompt.local_state.setdefault("initial_input", user_input)
         self._prompts[task_id] = prompt
@@ -331,6 +387,7 @@ class Scheduler:
         prompt.local_state["preflight_decision"] = "serialize" if conflict_sessions else "allow"
         prompt.local_state["preflight_decision_required"] = bool(conflict_sessions)
         prompt.local_state["preflight_blocking_notice_emitted"] = False
+        prompt.local_state["session_runtime_state"] = self._session_state_store.load(prompt.session_id).to_state()
         self._session_preflight_resources.setdefault(prompt.session_id, set()).update(preflight_keys)
         self._session_declared_outputs.setdefault(prompt.session_id, set()).update(declared_outputs)
         prompt.status = "pending"
@@ -465,6 +522,12 @@ class Scheduler:
             prompt.status = "running"
             prompt.touch()
             self._publish_log(task_id, "started")
+            seed_snapshot, seed_memory_items, seed_memory_summary = self._load_session_runtime_seed(session_id)
+            prompt.local_state["session_runtime_seed"] = {
+                "context_snapshot": seed_snapshot,
+                "memory_items_count": len(seed_memory_items),
+                "memory_summary": seed_memory_summary,
+            }
 
             cancel_event = asyncio.Event()
             pause_event = asyncio.Event()
@@ -511,6 +574,13 @@ class Scheduler:
                 tools=tools,
                 event_callback=lambda msg, tid=task_id: self._publish_log(tid, msg),
                 hook_runtime=self._hook_runtime,
+                context_seed=seed_snapshot,
+                memory_seed=seed_memory_items,
+                prompt_assembler=self._prompt_assembler,
+                compaction_engine=self._compaction_engine,
+                state_update_callback=lambda snapshot, items, summary, _sid=session_id: self._save_session_runtime_delta(
+                    _sid, snapshot, items, summary
+                ),
             )
             self._running[task_id] = asyncio.create_task(self._run_agent(task_id, agent))
 
@@ -521,6 +591,15 @@ class Scheduler:
         session_id = self._task_to_session.get(task_id)
         try:
             await agent.run(cancel_event=cancel_event, pause_event=pause_event)
+            context_snapshot = prompt.local_state.get("context_snapshot")
+            memory_summary = str(prompt.local_state.get("memory_summary", ""))
+            if isinstance(context_snapshot, dict):
+                self._save_session_runtime_delta(
+                    session_id,
+                    context_snapshot=context_snapshot,
+                    memory_items=list(self._session_state_store.load(session_id).memory_items) if session_id else [],
+                    memory_summary=memory_summary,
+                )
             declared_outputs = list(prompt.local_state.get("preflight_declared_outputs", []))
             if session_id and declared_outputs:
                 self._session_observed_outputs.setdefault(session_id, set()).update(declared_outputs)
@@ -537,7 +616,20 @@ class Scheduler:
             prompt.error = str(exc)
             prompt.touch()
             self._publish_log(task_id, f"failed: {exc}")
+            context_snapshot = prompt.local_state.get("context_snapshot", {})
+            memory_summary = str(prompt.local_state.get("memory_summary", ""))
+            if session_id and isinstance(context_snapshot, dict):
+                self._session_state_store.save_checkpoint(
+                    session_id,
+                    self._checkpoint_recovery.capture(
+                        task_state=prompt.local_state,
+                        context_snapshot=context_snapshot,
+                        memory_summary=memory_summary,
+                    ),
+                )
         finally:
+            if session_id and prompt.status in {"completed", "cancelled"}:
+                self._session_state_store.clear_checkpoint(session_id)
             declared_outputs = list(prompt.local_state.get("preflight_declared_outputs", []))
             if session_id and declared_outputs:
                 for output_key in declared_outputs:

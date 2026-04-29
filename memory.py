@@ -5,8 +5,8 @@ from typing import Any
 
 
 class LocalMemory:
-    def __init__(self) -> None:
-        self._items: list[Any] = []
+    def __init__(self, initial_items: list[Any] | None = None) -> None:
+        self._items: list[Any] = list(initial_items or [])
 
     async def append(self, item: Any) -> None:
         self._items.append(item)
@@ -25,12 +25,20 @@ class SharedReadonlyMemory:
 
 
 class LayeredContext:
-    def __init__(self, system_prompt: str, user_input: str, max_recent_turns: int = 8) -> None:
+    def __init__(
+        self,
+        system_prompt: str,
+        user_input: str,
+        max_recent_turns: int = 8,
+        initial_recent_turns: list[dict[str, str]] | None = None,
+        initial_compact_notes: list[str] | None = None,
+    ) -> None:
         self._system_prompt = system_prompt
         self._user_input = user_input
         self._max_recent_turns = max_recent_turns
-        self._recent_turns: list[dict[str, str]] = []
-        self._compact_notes: list[str] = []
+        self._recent_turns: list[dict[str, str]] = list(initial_recent_turns or [])
+        self._compact_notes: list[str] = list(initial_compact_notes or [])
+        self._micro_compact_if_needed()
 
     def append_turn(self, role: str, content: str) -> None:
         self._recent_turns.append({"role": role, "content": content})
@@ -66,6 +74,22 @@ class LayeredContext:
             "compact_notes": list(self._compact_notes),
             "max_recent_turns": self._max_recent_turns,
         }
+
+    def restore(self, snapshot: dict[str, Any]) -> None:
+        recent_turns = snapshot.get("recent_turns", [])
+        compact_notes = snapshot.get("compact_notes", [])
+        if isinstance(recent_turns, list):
+            normalized_recent = []
+            for item in recent_turns:
+                if isinstance(item, dict):
+                    role = str(item.get("role", "")).strip()
+                    content = str(item.get("content", ""))
+                    if role:
+                        normalized_recent.append({"role": role, "content": content})
+            self._recent_turns = normalized_recent
+        if isinstance(compact_notes, list):
+            self._compact_notes = [str(note) for note in compact_notes if str(note).strip()]
+        self._micro_compact_if_needed()
 
 
 def summarize_local_memory(items: list[Any], limit: int = 6) -> str:

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 from collections.abc import Callable
 from typing import Any
 
 from hook_runtime import HookRuntime
 from llm_client import LLMClient
 from memory import LayeredContext, LocalMemory, summarize_local_memory
+from session_runtime import CompactionEngine, DefaultCompactionEngine, DefaultPromptAssembler, PromptAssembler
 from task import Prompt
 from tools import ToolRegistry
 
@@ -19,13 +22,19 @@ class AgentInstance:
         tools: ToolRegistry,
         event_callback: Callable[[str], None] | None = None,
         hook_runtime: HookRuntime | None = None,
+        context_seed: dict[str, Any] | None = None,
+        memory_seed: list[Any] | None = None,
+        prompt_assembler: PromptAssembler | None = None,
+        compaction_engine: CompactionEngine | None = None,
+        state_update_callback: Callable[[dict[str, Any], list[Any], str], None] | None = None,
     ) -> None:
         self.task = task
         self.llm_client = llm_client
         self.tools = tools
         self._event_callback = event_callback
         self.hook_runtime = hook_runtime
-        self.memory = LocalMemory()
+        self._state_update_callback = state_update_callback
+        self.memory = LocalMemory(initial_items=memory_seed)
         tool_names = self.tools.list_tool_names()
         self._system_prompt = (
             "You are an autonomous agent.\n"
@@ -37,7 +46,17 @@ class AgentInstance:
             "If you can answer directly, use final.\n"
             "Do not output markdown fences."
         )
-        self.layered_context = LayeredContext(self._system_prompt, task.input, max_recent_turns=8)
+        snapshot = context_seed or {}
+        self.layered_context = LayeredContext(
+            self._system_prompt,
+            task.input,
+            max_recent_turns=8,
+            initial_recent_turns=snapshot.get("recent_turns", []),
+            initial_compact_notes=snapshot.get("compact_notes", []),
+        )
+        self._prompt_assembler: PromptAssembler = prompt_assembler or DefaultPromptAssembler()
+        self._compaction_engine: CompactionEngine = compaction_engine or DefaultCompactionEngine()
+        self._debug_enabled = os.getenv("PARAGENTS_TUI_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
 
     def _emit(self, message: str) -> None:
         if self._event_callback is not None:
@@ -72,6 +91,16 @@ class AgentInstance:
             self._emit(f"{tool_name} stdout: {out_preview}")
         if err_preview:
             self._emit(f"{tool_name} stderr: {err_preview}")
+
+    def _emit_context_debug(self) -> None:
+        if not self._debug_enabled:
+            return
+        snapshot = self.layered_context.snapshot()
+        compact_notes = snapshot.get("compact_notes", [])
+        recent_turns = snapshot.get("recent_turns", [])
+        self._emit("debug.context.compact_notes=" + json.dumps(compact_notes, ensure_ascii=True))
+        self._emit("debug.memory_summary=" + str(self.task.local_state.get("memory_summary", "")))
+        self._emit("debug.context.recent_turns=" + json.dumps(recent_turns[-4:], ensure_ascii=True))
 
     def _apply_stop_hook(self, reason: str) -> None:
         if self.hook_runtime is None:
@@ -118,7 +147,11 @@ class AgentInstance:
                     await asyncio.sleep(0.1)
 
             self._emit(f"step={step + 1}: llm infer")
-            llm_input = self.layered_context.export_for_infer()
+            llm_input = self._prompt_assembler.build_messages(
+                system_prompt=self._system_prompt,
+                user_input=self.task.input,
+                context_snapshot=self.layered_context.snapshot(),
+            )
             llm_output = await self.llm_client.infer(llm_input)
             output_type = llm_output.get("type")
 
@@ -196,7 +229,18 @@ class AgentInstance:
                     "user",
                     f"Tool observation for {tool_name}: {observation}. Continue and return JSON only.",
                 )
+                compacted_snapshot = self._compaction_engine.compact_context_snapshot(self.layered_context.snapshot())
+                self.layered_context.restore(compacted_snapshot)
+                memory_items = self._compaction_engine.cap_memory_items(memory_items)
+                self.task.local_state["memory_summary"] = summarize_local_memory(memory_items)
                 self.task.local_state["context_snapshot"] = self.layered_context.snapshot()
+                if self._state_update_callback is not None:
+                    self._state_update_callback(
+                        self.task.local_state["context_snapshot"],
+                        memory_items,
+                        self.task.local_state["memory_summary"],
+                    )
+                self._emit_context_debug()
                 self.task.touch()
                 self._emit(f"step={step + 1}: tool observation received")
                 continue
