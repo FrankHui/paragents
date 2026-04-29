@@ -19,7 +19,7 @@ from session_runtime import (
     DefaultCheckpointRecovery,
     DefaultCompactionEngine,
     DefaultPromptAssembler,
-    InMemorySessionStateStore,
+    JsonlSessionStateStore,
 )
 from task import Prompt
 from tools import ToolRegistry
@@ -61,7 +61,7 @@ class Scheduler:
         )
         self._debug_prompt_seq = 0
         self._hook_runtime = HookRuntime.load_from_path(Path.cwd() / ".paragents" / "hooks.json")
-        self._session_state_store = InMemorySessionStateStore()
+        self._session_state_store = JsonlSessionStateStore(Path.cwd() / ".paragents" / "session_runtime_state.jsonl")
         self._prompt_assembler = DefaultPromptAssembler()
         self._compaction_engine = DefaultCompactionEngine()
         self._checkpoint_recovery = DefaultCheckpointRecovery()
@@ -278,8 +278,10 @@ class Scheduler:
             return {}, [], ""
         state = self._session_state_store.load(session_id)
         snapshot = {
+            "session_id": session_id,
             "recent_turns": list(state.recent_turns),
             "compact_notes": list(state.compact_notes),
+            "memory_summary": state.memory_summary,
         }
         return snapshot, list(state.memory_items), state.memory_summary
 

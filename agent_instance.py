@@ -136,10 +136,13 @@ class AgentInstance:
 
     async def _sync_runtime_state(self) -> None:
         memory_items = self._compaction_engine.cap_memory_items(await self.memory.snapshot())
-        compacted_snapshot = self._compaction_engine.compact_context_snapshot(self.layered_context.snapshot())
-        self.layered_context.restore(compacted_snapshot)
+        snapshot = self.layered_context.snapshot()
+        if self._compaction_engine.should_compact(snapshot):
+            snapshot = self._compaction_engine.compact(snapshot)
+            self.layered_context.restore(snapshot)
+        compacted_snapshot = self.layered_context.snapshot()
         self.task.local_state["memory_summary"] = summarize_local_memory(memory_items)
-        self.task.local_state["context_snapshot"] = self.layered_context.snapshot()
+        self.task.local_state["context_snapshot"] = compacted_snapshot
         if self._state_update_callback is not None:
             self._state_update_callback(
                 self.task.local_state["context_snapshot"],
