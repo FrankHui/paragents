@@ -9,7 +9,7 @@ from scheduler import Scheduler
 class _SleepLLM:
     async def infer(self, messages):  # noqa: ANN001
         await asyncio.sleep(0.2)
-        return {"type": "final", "content": "ok"}
+        return {"type": "turn_done", "content": "ok"}
 
 
 def test_conflict_prompt_can_continue_after_override(tmp_path: Path, monkeypatch) -> None:
@@ -18,8 +18,8 @@ def test_conflict_prompt_can_continue_after_override(tmp_path: Path, monkeypatch
 
     async def _run() -> None:
         await scheduler.start()
-        first_id = await scheduler.submit("python a.py > reports/result.json", tools={}, session_id="session-A")
-        second_id = await scheduler.submit("python b.py > reports/result.json", tools={}, session_id="session-B")
+        first_id = await scheduler.create_session_prompt("python a.py > reports/result.json", tools={}, session_id="session-A")
+        second_id = await scheduler.create_session_prompt("python b.py > reports/result.json", tools={}, session_id="session-B")
 
         await asyncio.sleep(0.08)
         first = scheduler.prompts[first_id]
@@ -43,8 +43,8 @@ def test_conflict_prompt_does_not_auto_run_after_blocker_finishes_without_overri
 
     async def _run() -> None:
         await scheduler.start()
-        await scheduler.submit("python a.py > reports/result.json", tools={}, session_id="session-A")
-        second_id = await scheduler.submit("python b.py > reports/result.json", tools={}, session_id="session-B")
+        await scheduler.create_session_prompt("python a.py > reports/result.json", tools={}, session_id="session-A")
+        second_id = await scheduler.create_session_prompt("python b.py > reports/result.json", tools={}, session_id="session-B")
         await asyncio.sleep(0.35)
         second = scheduler.prompts[second_id]
         assert second.status == "pending"

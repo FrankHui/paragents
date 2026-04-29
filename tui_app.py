@@ -199,7 +199,7 @@ class ParagentsTUI:
         self.command_completer = WordCompleter(
             [
                 "/new",
-                "/run",
+                "/prompt",
                 "/submit",
                 "/list",
                 "/switch",
@@ -219,7 +219,7 @@ class ParagentsTUI:
         )
         self._slash_commands: list[str] = [
             "/new",
-            "/run",
+            "/prompt",
             "/submit",
             "/list",
             "/switch",
@@ -253,7 +253,7 @@ class ParagentsTUI:
         self._session_command_history: dict[str, list[str]] = {}
         self.option_items: list[tuple[str, str]] = [
             ("/new <task>", "/new "),
-            ("/run <task>", "/run "),
+            ("/prompt <task>", "/prompt "),
             ("/list", "/list"),
             ("/approvals", "/approvals"),
             ("/switch <session_id>", "/switch "),
@@ -937,7 +937,7 @@ class ParagentsTUI:
         canonical = raw_effective
         known_prefixes = (
             "new ",
-            "run ",
+            "prompt ",
             "submit ",
             "list",
             "switch ",
@@ -952,7 +952,7 @@ class ParagentsTUI:
             "exit",
         )
         if canonical and not canonical.startswith(known_prefixes) and canonical not in {"y", "n"}:
-            canonical = f"{'run' if self.foreground_task_id else 'new'} {canonical}"
+            canonical = f"{'prompt' if self.foreground_task_id else 'new'} {canonical}"
 
         session_id = self._current_session_id()
         if not session_id:
@@ -986,16 +986,16 @@ class ParagentsTUI:
 
         current = list(self._session_command_history.get(session_id, []))
 
-        if not current and normalized.startswith(("new ", "run ")):
+        if not current and normalized.startswith(("new ", "prompt ")):
             head, payload = normalized.split(" ", 1)
             payload = payload.strip()
             if payload:
                 current.append(f"/{head} {payload}")
 
-        if normalized.startswith("run "):
-            payload = normalized[len("run ") :].strip()
+        if normalized.startswith("prompt "):
+            payload = normalized[len("prompt ") :].strip()
             if payload:
-                run_cmd = f"/run {payload}"
+                run_cmd = f"/prompt {payload}"
                 if run_cmd not in current:
                     current.append(run_cmd)
 
@@ -1356,12 +1356,11 @@ class ParagentsTUI:
     def _welcome_text(self) -> str:
         return (
             "╔══════════════════════════════════════════════════════════╗\n"
-            "║                    PARAGENTS TERMINAL                    ║\n"
-            "║                     Claude-like TUI                      ║\n"
+            "║                    PARAGENTS TUI                         ║\n"
             "╠══════════════════════════════════════════════════════════╣\n"
             "║ Welcome. Type command and press Enter.                   ║\n"
             "║ Capacity: total session slots <= 5                       ║\n"
-            "║ /switch|/resume -> foreground                             ║\n"
+            "║ /switch|/resume -> foreground                            ║\n"
             "║ /close <id> is required to release a session slot        ║\n"
             "║ Tab complete | Up/Down仅多行编辑 | Ctrl+R会话历史命令    ║\n"
             "║ Ctrl+X 取消运行中prompt | Ctrl+U 清空输入                ║\n"
@@ -1659,8 +1658,8 @@ class ParagentsTUI:
             if raw.isdigit() or re.fullmatch(r"\d+(?:/\d+)+", raw):
                 cmd = raw
             else:
-                if raw.lower() in {"y", "n"}:
-                    cmd = raw.lower()
+                if raw in {"y", "n", "yes", "no", "Y", "N", "Yes", "No", "YES", "NO"}:
+                    cmd = "y" if raw.lower().startswith("y") else "n"
                 else:
                     normalized = normalize_tui_command(raw)
                     cmd = f"__slash__ {normalized}" if raw.startswith("/") else normalized
@@ -1743,13 +1742,13 @@ class ParagentsTUI:
             output = await self.command_handler(cmd)
             if self.foreground_task_id_provider is not None or self.task_slot_ids_provider is not None:
                 self._refresh_external_state()
-            if effective_cmd in {"y", "n"} and self.foreground_task_id:
+            if effective_cmd in {"y", "n", "yes", "no", "Y", "N", "Yes", "No", "YES", "NO"} and self.foreground_task_id:
                 self._pending_approval_by_task.pop(self.foreground_task_id, None)
             if output and output[0] == "unknown command":
                 output = [
                     f"不支持的指令: {effective_cmd}",
-                    "可用命令: /new, /run, /submit, /list, /switch, /close, /approvals, /approve, /deny, /pause, /resume, /cancel, /quit",
-                    "提示: 非 / 开头输入会自动按有无 foreground 映射为 /new 或 /run。",
+                    "可用命令: /new, /prompt, /submit, /list, /switch, /close, /approvals, /approve, /deny, /pause, /resume, /cancel, /quit",
+                    "提示: 非 / 开头输入会自动按有无 foreground 映射为 /new 或 /prompt。",
                 ]
             lines = self._shorten_ids(output if output else ["(no output)"])
             self._trace_render_event(
@@ -1797,7 +1796,7 @@ class ParagentsTUI:
 
     # Backward-compatible helper for older tests/tools.
     def _update_watch_state(self, cmd: str, output: list[str]) -> None:
-        if cmd.startswith("run "):
+        if cmd.startswith("prompt "):
             for line in output:
                 if line.startswith("submitted: "):
                     parts = line.split()

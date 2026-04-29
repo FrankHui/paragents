@@ -67,12 +67,12 @@ def _request_ref(permission_manager: PermissionManager, request_id: str) -> str:
 
 def _print_help() -> None:
     print("输入模式：")
-    print("  /命令                显式执行命令（例如 /list, /run xxx）")
-    print("  普通语句             自动按 /run <语句> 处理")
+    print("  /命令                显式执行命令（例如 /list, /prompt xxx）")
+    print("  普通语句             自动按 /prompt <语句> 处理")
     print("")
     print("Commands (/前缀):")
     print("  /new <text>           新建 foreground 会话")
-    print("  /run <text>           在当前 foreground 会话上续跑（需会话空闲）")
+    print("  /prompt <text>        在当前 foreground 会话上续跑（需会话空闲）")
     print("  /submit <text>        提交后台任务")
     print("  /list                 List sessions")
     print("  /switch <session_id>  切换 foreground 到指定会话")
@@ -95,10 +95,10 @@ def _print_help() -> None:
     print("")
     print("运行模型：")
     print("  总槽位最多 5 个（按会话计数，单会话可包含多个子任务）")
-    print("  非 / 开头输入默认按 /run <text> 处理")
+    print("  非 / 开头输入默认按 /prompt <text> 处理")
     print("")
     print("审批提示：")
-    print("  /run 触发审批时，可直接输入 y/n + 回车确认。")
+    print("  /prompt 触发审批时，可直接输入 y/n + 回车确认。")
     print("  submit 模式保持 request_id 手动 approve/deny。")
     print("")
     print("兼容别名: :h :a :p :s <text> :sv <text>")
@@ -108,8 +108,8 @@ def _normalize_user_input(raw: str) -> str:
     cmd = normalize_command_alias(raw.strip())
     if not cmd:
         return ""
-    if cmd.lower() in {"y", "n"}:
-        return cmd.lower()
+    if cmd in {"y", "n", "yes", "no", "Y", "N", "Yes", "No", "YES", "NO"}:
+        return "y" if cmd.lower().startswith("y") else "n"
     if cmd.startswith("/"):
         return cmd[1:].strip()
     if cmd.startswith("submit ") or cmd.startswith("/submit "):
@@ -135,10 +135,10 @@ def _parse_new(cmd: str) -> str | None:
     return body
 
 
-def _parse_run(cmd: str) -> str | None:
-    if not cmd.startswith("run "):
+def _parse_prompt(cmd: str) -> str | None:
+    if not cmd.startswith("prompt "):
         return None
-    body = cmd[len("run ") :].strip()
+    body = cmd[len("prompt ") :].strip()
     if not body:
         return None
     return body
@@ -197,7 +197,7 @@ async def _run_cli() -> None:
         tools: dict[str, Any],
         session_id: str | None = None,
     ) -> str:
-        return await scheduler.submit(
+        return await scheduler.create_session_prompt(
             input_text,
             tools=tools,
             session_id=session_id,
@@ -236,7 +236,7 @@ async def _run_cli() -> None:
         if not cmd:
             continue
 
-        if cmd in {"y", "n"} and pending_run_request_id:
+        if cmd in {"y", "n", "yes", "no", "Y", "N", "Yes", "No", "YES", "NO"} and pending_run_request_id:
             lines = await _handle_run_approval_answer(cmd, pending_run_request_id, permission_manager, scheduler)
             for line in lines:
                 print(line)
@@ -256,12 +256,16 @@ async def _run_cli() -> None:
             content = parsed
             watch_mode = True
             if not content:
-                print("run content is empty" if cmd.startswith("run ") else "submit content is empty")
+                print("prompt content is empty" if cmd.startswith("prompt ") else "submit content is empty")
                 continue
-            prompt_id = await scheduler.submit(
-                content,
-                tools=_build_main_tools(),
-            )
+            try:
+                prompt_id = await scheduler.create_session_prompt(
+                    content,
+                    tools=_build_main_tools(),
+                )
+            except ValueError as exc:
+                print(str(exc))
+                continue
             print("submitted:", _prompt_ref(scheduler.prompts, prompt_id), "(quiet)" if not watch_mode else "(watching)")
             if watch_mode:
                 if watching_handle is not None:
@@ -270,7 +274,7 @@ async def _run_cli() -> None:
                         await watching_handle
                 watching_handle = asyncio.create_task(_watch_prompt_logs(scheduler, prompt_id, replay=True))
                 watching_prompt_id = prompt_id
-            if cmd.startswith("run "):
+            if cmd.startswith("prompt "):
                 run_prompt_id = prompt_id
                 pending_run_request_id = None
                 last_prompted_run_request_id = None
@@ -415,7 +419,7 @@ async def _run_cli() -> None:
 def _setup_readline() -> None:
     commands = [
         "/new",
-        "/run",
+        "/prompt",
         "/submit",
         "/list",
         "/switch",
@@ -678,7 +682,7 @@ async def _run_tui_mode() -> None:
         tools: dict[str, Any],
         session_id: str | None = None,
     ) -> str:
-        return await scheduler.submit(
+        return await scheduler.create_session_prompt(
             input_text,
             tools=tools,
             session_id=session_id,
@@ -744,11 +748,11 @@ async def _run_tui_mode() -> None:
         pending_run_request_id = _get_active_approval_request_id(
             scheduler, foreground_prompt_id, foreground_prompt_id
         )
-        if cmd in {"y", "n"} and pending_run_request_id:
+        if cmd in {"y", "n", "yes", "no", "Y", "N", "Yes", "No", "YES", "NO"} and pending_run_request_id:
             return await _handle_run_approval_answer(cmd, pending_run_request_id, permission_manager, scheduler)
         known_prefixes = (
             "new ",
-            "run ",
+            "prompt ",
             "submit ",
             "list",
             "switch ",
@@ -774,11 +778,9 @@ async def _run_tui_mode() -> None:
             "help",
             "quit",
             "exit",
-            "y",
-            "n",
         )
         if not slash_mode and not cmd.startswith(known_prefixes):
-            cmd = f"{'run' if foreground_prompt_id else 'new'} {cmd}"
+            cmd = f"{'prompt' if foreground_prompt_id else 'new'} {cmd}"
         if cmd.startswith("close "):
             _refresh_task_state()
             raw_task_id = cmd.split(" ", 1)[1].strip()
@@ -873,7 +875,10 @@ async def _run_tui_mode() -> None:
             _refresh_task_state()
             if len(session_slots) >= 5:
                 return ["会话槽位已满（最多 5 个），请先 /close 释放后再运行。", *_close_prompt_lines()]
-            task_id = await scheduler.submit(new_content, tools=_build_main_tools())
+            try:
+                task_id = await scheduler.create_session_prompt(new_content, tools=_build_main_tools())
+            except ValueError as exc:
+                return [str(exc)]
             session_id = scheduler.get_prompt_session_id(task_id) or task_id
             if session_id not in session_slots:
                 session_slots.append(session_id)
@@ -893,7 +898,7 @@ async def _run_tui_mode() -> None:
                 )
             return out
 
-        run_content = _parse_run(cmd)
+        run_content = _parse_prompt(cmd)
         if run_content is not None:
             _refresh_task_state()
             if foreground_prompt_id is None:
@@ -901,8 +906,8 @@ async def _run_tui_mode() -> None:
             fg_task = scheduler.prompts.get(foreground_prompt_id)
             fg_status = str(getattr(fg_task, "status", "")) if fg_task is not None else ""
             if fg_status in {"running", "pending", "paused"}:
-                return [f"foreground 会话 {_prompt_ref(scheduler.prompts, foreground_prompt_id)} 正在执行中，当前不可 /run 新序列。"]
-            ok = await scheduler.continue_task(foreground_prompt_id, run_content)
+                return [f"foreground 会话 {_prompt_ref(scheduler.prompts, foreground_prompt_id)} 正在执行中，当前不可 /prompt 新序列。"]
+            ok = await scheduler.continue_session_prompt(foreground_prompt_id, run_content)
             if not ok:
                 return [f"foreground 会话 {_prompt_ref(scheduler.prompts, foreground_prompt_id)} 当前不可续跑。"]
             log_prompt_id = None
@@ -929,7 +934,10 @@ async def _run_tui_mode() -> None:
             _refresh_task_state()
             if len(session_slots) >= 5:
                 return ["会话槽位已满（最多 5 个），请先 /close 释放后再提交。", *_close_prompt_lines()]
-            task_id = await scheduler.submit(content, tools=_build_main_tools())
+            try:
+                task_id = await scheduler.create_session_prompt(content, tools=_build_main_tools())
+            except ValueError as exc:
+                return [str(exc)]
             session_id = scheduler.get_prompt_session_id(task_id) or task_id
             if session_id not in session_slots:
                 session_slots.append(session_id)

@@ -45,11 +45,11 @@
 
 ## 在你的 Paragents 里如何触发
 
-- 直接语句（会默认转 `/run`）：
+- 直接语句（会默认转 `/prompt`）：
   - `python mock_tasks/py_sleep_success.py --seconds 8`
 
 - 显式命令：
-  - `/run bash mock_tasks/sh_fail_after_sleep.sh 5 1`
+  - `/prompt bash mock_tasks/sh_fail_after_sleep.sh 5 1`
 
 提示：`*_prompt_input*` 脚本会阻塞等待输入，适合测试“长时间运行/等待交互”状态。
 另外：`py_long_logs_for_paging.py` 适合测试右侧小面板日志翻页（`PgUp` / `PgDn`）。

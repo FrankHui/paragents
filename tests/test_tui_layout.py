@@ -141,7 +141,7 @@ def test_run_command_sets_watch_task_id() -> None:
         pending_approvals_provider=lambda: 0,
         command_handler=_handler,
     )
-    tui._update_watch_state("run hello", ["submitted: task-123 (watching)"])
+    tui._update_watch_state("prompt hello", ["submitted: task-123 (watching)"])
     assert tui.watching_task_id == "task-123"
 
 
@@ -420,7 +420,7 @@ def test_slash_prefix_popup_filters_commands_incrementally() -> None:
     tui.input_buffer.text = "/"
     tui._refresh_context_popup()
     assert tui.context_popup_mode == "slash"
-    assert ("/run", "/run") in tui.context_candidates
+    assert ("/prompt", "/prompt") in tui.context_candidates
     assert ("/approve", "/approve") in tui.context_candidates
 
     tui.input_buffer.text = "/ap"
@@ -757,7 +757,7 @@ def test_run_command_always_appends_output_lines() -> None:
         command_handler=_handler,
     )
     tui.show_welcome = False
-    asyncio.run(tui._run_command("run hello"))
+    asyncio.run(tui._run_command("prompt hello"))
     assert any("submitted:" in line for line in tui.logs)
 
 
@@ -967,7 +967,7 @@ def test_session_history_records_natural_language_as_run_for_foreground_session(
 
     tui._record_session_history_command("写一个 quick sort")
 
-    assert tui._session_command_history["session-abc"] == ["/run 写一个 quick sort"]
+    assert tui._session_command_history["session-abc"] == ["/prompt 写一个 quick sort"]
 
 
 def test_session_history_popup_returns_recorded_candidates() -> None:
@@ -985,10 +985,10 @@ def test_session_history_popup_returns_recorded_candidates() -> None:
     )
     tui.show_welcome = False
     tui.foreground_task_id = task.task_id
-    tui._record_session_history_command("run hello world")
+    tui._record_session_history_command("prompt hello world")
 
     tui._show_session_run_history_popup()
 
     assert tui.context_popup_mode == "session_run_history"
     assert tui.context_candidates
-    assert tui.context_candidates[0][0] == "/run hello world"
+    assert tui.context_candidates[0][0] == "/prompt hello world"

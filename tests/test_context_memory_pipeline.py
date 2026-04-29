@@ -27,7 +27,7 @@ class _TwoToolThenFinalLLM:
         self._calls += 1
         if self._calls <= 2:
             return {"type": "tool", "tool_name": "run_command", "args": {"command": "echo hi"}}
-        return {"type": "final", "content": "done"}
+        return {"type": "turn_done", "content": "done"}
 
 
 class _ManyToolThenFinalLLM:
@@ -40,7 +40,7 @@ class _ManyToolThenFinalLLM:
         self._calls += 1
         if self._calls <= self._tool_rounds:
             return {"type": "tool", "tool_name": "run_command", "args": {"command": f"echo hi-{self._calls}"}}
-        return {"type": "final", "content": "done"}
+        return {"type": "turn_done", "content": "done"}
 
 
 async def _ok_tool(args):  # noqa: ANN001

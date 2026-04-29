@@ -134,9 +134,9 @@ def normalize_tui_command(cmd: str) -> str:
     if not cmd:
         return ""
     if cmd.startswith(":s "):
-        return "run " + cmd[3:].strip()
+        return "prompt " + cmd[3:].strip()
     if cmd.startswith(":sv "):
-        return "run " + cmd[4:].strip()
+        return "prompt " + cmd[4:].strip()
     if cmd == ":a":
         return "approvals"
     if cmd.startswith("/"):

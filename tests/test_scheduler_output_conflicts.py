@@ -35,8 +35,8 @@ def test_submit_records_output_conflict_details_and_declared_outputs(tmp_path: P
     monkeypatch.chdir(tmp_path)
     scheduler = Scheduler(llm_client=None)
 
-    first_id = asyncio.run(scheduler.submit("python a.py > reports/result.json", tools={}, session_id="session-A"))
-    second_id = asyncio.run(scheduler.submit("python b.py > reports/result.json", tools={}, session_id="session-B"))
+    first_id = asyncio.run(scheduler.create_session_prompt("python a.py > reports/result.json", tools={}, session_id="session-A"))
+    second_id = asyncio.run(scheduler.create_session_prompt("python b.py > reports/result.json", tools={}, session_id="session-B"))
 
     first = scheduler.prompts[first_id]
     second = scheduler.prompts[second_id]
@@ -57,8 +57,8 @@ def test_python_capability_overlap_does_not_create_conflict(tmp_path: Path, monk
     monkeypatch.chdir(tmp_path)
     scheduler = Scheduler(llm_client=None)
 
-    first_id = asyncio.run(scheduler.submit("python a.py", tools={}, session_id="session-A"))
-    second_id = asyncio.run(scheduler.submit("python b.py", tools={}, session_id="session-B"))
+    first_id = asyncio.run(scheduler.create_session_prompt("python a.py", tools={}, session_id="session-A"))
+    second_id = asyncio.run(scheduler.create_session_prompt("python b.py", tools={}, session_id="session-B"))
 
     first = scheduler.prompts[first_id]
     second = scheduler.prompts[second_id]
@@ -73,7 +73,7 @@ def test_output_lock_released_when_startup_fails(tmp_path: Path, monkeypatch) ->
 
     async def _run() -> None:
         await scheduler.start()
-        prompt_id = await scheduler.submit("python a.py > reports/result.json", tools={}, session_id="session-A")
+        prompt_id = await scheduler.create_session_prompt("python a.py > reports/result.json", tools={}, session_id="session-A")
         await asyncio.sleep(0.2)
         prompt = scheduler.prompts[prompt_id]
         assert prompt.status == "failed"
@@ -84,3 +84,42 @@ def test_output_lock_released_when_startup_fails(tmp_path: Path, monkeypatch) ->
             scheduler._dispatch_task.cancel()  # noqa: SLF001
 
     asyncio.run(_run())
+
+
+def test_submit_rejects_new_prompt_when_same_session_has_paused_prompt(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    scheduler = Scheduler(llm_client=None)
+    first_id = asyncio.run(scheduler.create_session_prompt("python a.py", tools={}, session_id="session-active"))
+    scheduler.prompts[first_id].status = "paused"
+
+    try:
+        asyncio.run(scheduler.create_session_prompt("python b.py", tools={}, session_id="session-active"))
+        raise AssertionError("expected ValueError when submitting second prompt to paused session")
+    except ValueError as exc:
+        assert "submit new prompt only after turn_done" in str(exc)
+
+
+def test_submit_rejects_new_prompt_when_same_session_has_running_prompt(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    scheduler = Scheduler(llm_client=None)
+    first_id = asyncio.run(scheduler.create_session_prompt("python a.py", tools={}, session_id="session-active-running"))
+    scheduler.prompts[first_id].status = "running"
+
+    try:
+        asyncio.run(scheduler.create_session_prompt("python b.py", tools={}, session_id="session-active-running"))
+        raise AssertionError("expected ValueError when submitting second prompt to running session")
+    except ValueError as exc:
+        assert "submit new prompt only after turn_done" in str(exc)
+
+
+def test_submit_rejects_new_prompt_when_latest_prompt_failed(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    scheduler = Scheduler(llm_client=None)
+    first_id = asyncio.run(scheduler.create_session_prompt("python a.py", tools={}, session_id="session-failed"))
+    scheduler.prompts[first_id].status = "failed"
+
+    try:
+        asyncio.run(scheduler.create_session_prompt("python b.py", tools={}, session_id="session-failed"))
+        raise AssertionError("expected ValueError when latest prompt is failed")
+    except ValueError as exc:
+        assert "submit new prompt only after turn_done" in str(exc)

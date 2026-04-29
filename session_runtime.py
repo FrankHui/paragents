@@ -109,7 +109,6 @@ class DefaultPromptAssembler:
         if isinstance(compact_notes, list) and compact_notes:
             compact_text = "\n".join(f"- {note}" for note in compact_notes[-6:])
             messages.append({"role": "system", "content": "Compact memory notes:\n" + compact_text})
-        messages.append({"role": "user", "content": user_input})
         recent_turns = context_snapshot.get("recent_turns", [])
         if isinstance(recent_turns, list):
             for turn in recent_turns:
@@ -119,6 +118,8 @@ class DefaultPromptAssembler:
                 content = str(turn.get("content", ""))
                 if role:
                     messages.append({"role": role, "content": content})
+        # Keep current user input as the latest message to avoid stale-turn response.
+        messages.append({"role": "user", "content": user_input})
         return messages
 
 

@@ -40,10 +40,10 @@ class AgentInstance:
             "You are an autonomous agent.\n"
             "You must respond with strict JSON only.\n"
             "Allowed output schema:\n"
-            '1) {"type":"final","content":"..."}\n'
+            '1) {"type":"turn_done","content":"..."}\n'
             '2) {"type":"tool","tool_name":"...","args":{...}}\n'
             f"Allowed tools: {tool_names}\n"
-            "If you can answer directly, use final.\n"
+            "If you can answer directly, use turn_done.\n"
             "Do not output markdown fences."
         )
         snapshot = context_seed or {}
@@ -57,6 +57,22 @@ class AgentInstance:
         self._prompt_assembler: PromptAssembler = prompt_assembler or DefaultPromptAssembler()
         self._compaction_engine: CompactionEngine = compaction_engine or DefaultCompactionEngine()
         self._debug_enabled = os.getenv("PARAGENTS_TUI_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+        self._started_once = False
+
+    def bind_turn(
+        self,
+        *,
+        task: Prompt,
+        llm_client: LLMClient,
+        tools: ToolRegistry,
+        event_callback: Callable[[str], None] | None = None,
+        state_update_callback: Callable[[dict[str, Any], list[Any], str], None] | None = None,
+    ) -> None:
+        self.task = task
+        self.llm_client = llm_client
+        self.tools = tools
+        self._event_callback = event_callback
+        self._state_update_callback = state_update_callback
 
     def _emit(self, message: str) -> None:
         if self._event_callback is not None:
@@ -118,9 +134,27 @@ class AgentInstance:
             self.task.touch()
             self._emit(f"blocked by hook(Stop): {decision.message}")
 
+    async def _sync_runtime_state(self) -> None:
+        memory_items = self._compaction_engine.cap_memory_items(await self.memory.snapshot())
+        compacted_snapshot = self._compaction_engine.compact_context_snapshot(self.layered_context.snapshot())
+        self.layered_context.restore(compacted_snapshot)
+        self.task.local_state["memory_summary"] = summarize_local_memory(memory_items)
+        self.task.local_state["context_snapshot"] = self.layered_context.snapshot()
+        if self._state_update_callback is not None:
+            self._state_update_callback(
+                self.task.local_state["context_snapshot"],
+                memory_items,
+                self.task.local_state["memory_summary"],
+            )
+        self._emit_context_debug()
+
     async def run(self, cancel_event: asyncio.Event, pause_event: asyncio.Event | None = None) -> None:
         max_steps = 10
-        self._emit("agent started")
+        if not self._started_once:
+            self._emit("agent started")
+            self._started_once = True
+        else:
+            self._emit("agent resumed turn")
         if self.hook_runtime is not None:
             submit_decision = self.hook_runtime.on_user_prompt_submit(
                 {"prompt_id": self.task.prompt_id, "session_id": self.task.session_id, "input": self.task.input}
@@ -147,6 +181,7 @@ class AgentInstance:
                     await asyncio.sleep(0.1)
 
             self._emit(f"step={step + 1}: llm infer")
+            await self._sync_runtime_state()
             llm_input = self._prompt_assembler.build_messages(
                 system_prompt=self._system_prompt,
                 user_input=self.task.input,
@@ -155,8 +190,14 @@ class AgentInstance:
             llm_output = await self.llm_client.infer(llm_input)
             output_type = llm_output.get("type")
 
-            if output_type == "final":
+            if output_type in {"turn_done", "final"}:
+                if output_type == "final":
+                    self._emit("deprecated output type: final; treat as turn_done")
                 self.task.result = llm_output.get("content")
+                # Treat turn_done as current turn completion, not session termination context.
+                self.layered_context.append_turn("user", self.task.input)
+                self.layered_context.append_turn("assistant", str(self.task.result or ""))
+                await self._sync_runtime_state()
                 self.task.status = "completed"
                 self.task.touch()
                 self._apply_stop_hook("completed")
@@ -188,8 +229,7 @@ class AgentInstance:
                 observation = await self.tools.call(tool_name, args)
                 await self.memory.append({"tool": tool_name, "args": args, "observation": observation})
                 self.task.local_state["last_observation"] = observation
-                memory_items = await self.memory.snapshot()
-                self.task.local_state["memory_summary"] = summarize_local_memory(memory_items)
+                self.task.local_state["memory_summary"] = summarize_local_memory(await self.memory.snapshot())
                 self._emit_stream_preview(tool_name, observation)
                 if self.hook_runtime is not None:
                     post_decision = self.hook_runtime.on_post_tool_use(
@@ -229,18 +269,7 @@ class AgentInstance:
                     "user",
                     f"Tool observation for {tool_name}: {observation}. Continue and return JSON only.",
                 )
-                compacted_snapshot = self._compaction_engine.compact_context_snapshot(self.layered_context.snapshot())
-                self.layered_context.restore(compacted_snapshot)
-                memory_items = self._compaction_engine.cap_memory_items(memory_items)
-                self.task.local_state["memory_summary"] = summarize_local_memory(memory_items)
-                self.task.local_state["context_snapshot"] = self.layered_context.snapshot()
-                if self._state_update_callback is not None:
-                    self._state_update_callback(
-                        self.task.local_state["context_snapshot"],
-                        memory_items,
-                        self.task.local_state["memory_summary"],
-                    )
-                self._emit_context_debug()
+                await self._sync_runtime_state()
                 self.task.touch()
                 self._emit(f"step={step + 1}: tool observation received")
                 continue

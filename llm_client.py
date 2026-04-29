@@ -163,7 +163,7 @@ class LLMClient:
     @staticmethod
     def _parse_agent_action(content: str) -> dict[str, Any]:
         # 约定 LLM 输出 JSON：
-        # {"type":"final","content":"..."}
+        # {"type":"turn_done","content":"..."}
         # {"type":"tool","tool_name":"calculator","args":{"expression":"1+1"}}
         try:
             parsed = json.loads(content)
@@ -172,4 +172,4 @@ class LLMClient:
         except json.JSONDecodeError:
             pass
 
-        return {"type": "final", "content": content}
+        return {"type": "turn_done", "content": content}

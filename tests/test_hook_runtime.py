@@ -26,7 +26,7 @@ class _FakeToolLLM:
 
 class _FakeFinalLLM:
     async def infer(self, messages):  # noqa: ANN001
-        return {"type": "final", "content": "ok"}
+        return {"type": "turn_done", "content": "ok"}
 
 
 async def _ok_tool(args):  # noqa: ANN001

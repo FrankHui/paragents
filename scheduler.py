@@ -31,6 +31,9 @@ class Scheduler:
         self._max_in_flight = max_in_flight
 
         self._pending_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._session_prompt_queues: dict[str, asyncio.Queue[str]] = {}
+        self._session_workers: dict[str, asyncio.Task[None]] = {}
+        self._in_flight_sessions = asyncio.Semaphore(max_in_flight)
         self._prompts: dict[str, Prompt] = {}
         self._task_tools: dict[str, dict[str, Any]] = {}
         self._task_to_session: dict[str, str] = {}
@@ -42,6 +45,7 @@ class Scheduler:
         self._session_observed_outputs: dict[str, set[str]] = {}
         self._output_locks: dict[str, str] = {}
         self._running: dict[str, asyncio.Task[None]] = {}
+        self._session_agents: dict[str, AgentInstance] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
         self._pause_events: dict[str, asyncio.Event] = {}
         self._task_logs: dict[str, list[str]] = {}
@@ -227,7 +231,7 @@ class Scheduler:
             await asyncio.sleep(max(0.0, delay_s))
             if scheduled_id not in self._scheduled_meta:
                 return
-            await self.submit(user_input, tools)
+            await self.create_session_prompt(user_input, tools)
             self._scheduled_meta.pop(scheduled_id, None)
             self._scheduled_handles.pop(scheduled_id, None)
 
@@ -314,7 +318,7 @@ class Scheduler:
         if self._dispatch_task is None or self._dispatch_task.done():
             self._dispatch_task = asyncio.create_task(self._dispatch_loop())
 
-    async def submit(
+    async def create_session_prompt(
         self,
         user_input: str,
         tools: dict[str, Any],
@@ -322,6 +326,15 @@ class Scheduler:
     ) -> str:
         task_id = self._next_prompt_id()
         session_id = self._resolve_session_id(session_id, task_id)
+        existing_session_prompt_ids = self._session_tasks.get(session_id, set())
+        existing_prompts = [self._prompts[pid] for pid in existing_session_prompt_ids if pid in self._prompts]
+        if existing_prompts:
+            latest_prompt = max(existing_prompts, key=lambda p: (getattr(p, "updated_at", 0.0), getattr(p, "created_at", 0.0)))
+            if latest_prompt.status != "completed":
+                raise ValueError(
+                    f"session {session_id} latest prompt {latest_prompt.prompt_id} status={latest_prompt.status}; "
+                    "submit new prompt only after turn_done"
+                )
         session_ref = self._assign_session_ref(session_id)
         existing_refs = {p.prompt_ref for p in self._prompts.values()}
         prompt_ref = generate_short_ref(existing_refs, length=6)
@@ -366,8 +379,8 @@ class Scheduler:
         await self._pending_queue.put(task_id)
         return task_id
 
-    async def continue_task(self, task_id: str, user_input: str) -> bool:
-        prompt = self._prompts.get(task_id)
+    async def continue_session_prompt(self, prompt_id: str, user_input: str) -> bool:
+        prompt = self._prompts.get(prompt_id)
         if prompt is None:
             return False
         if prompt.status in {"running", "pending", "paused"}:
@@ -393,8 +406,8 @@ class Scheduler:
         prompt.status = "pending"
         prompt.touch()
         if self._debug_enabled:
-            self._publish_log(task_id, f"continued: {user_input}")
-        await self._pending_queue.put(task_id)
+            self._publish_log(prompt_id, f"continued: {user_input}")
+        await self._pending_queue.put(prompt_id)
         return True
 
     async def cancel(self, task_id: str) -> None:
@@ -457,117 +470,143 @@ class Scheduler:
 
     async def _dispatch_loop(self) -> None:
         while True:
-            if len(self._running) >= self._max_in_flight:
-                await asyncio.sleep(0.05)
-                continue
-
             task_id = await self._pending_queue.get()
             prompt = self._prompts.get(task_id)
             if prompt is None:
                 continue
 
-            if prompt.status in ("completed", "cancelled", "running"):
+            if prompt.status in ("completed", "cancelled"):
                 continue
 
             session_id = self._task_to_session.get(task_id)
-            blockers = set(prompt.local_state.get("preflight_conflict_with_sessions", []))
-            declared_outputs = list(prompt.local_state.get("preflight_declared_outputs", []))
-            allow_override = bool(prompt.local_state.get("preflight_user_override", False))
-            needs_user_decision = bool(prompt.local_state.get("preflight_decision_required", False))
-            if needs_user_decision and not allow_override:
-                if not bool(prompt.local_state.get("preflight_blocking_notice_emitted", False)):
-                    session_refs = ", ".join(sorted(blockers)) if blockers else "(unknown)"
-                    self._publish_log(
-                        task_id,
-                        f"conflict decision pending: waiting on serialize conflicts: {session_refs}; use /override or /cancel",
-                    )
-                    prompt.local_state["preflight_blocking_notice_emitted"] = True
+            if session_id is None:
+                continue
+            queue = self._session_prompt_queues.setdefault(session_id, asyncio.Queue())
+            await queue.put(task_id)
+            worker = self._session_workers.get(session_id)
+            if worker is None or worker.done():
+                self._session_workers[session_id] = asyncio.create_task(self._run_session_worker(session_id))
+
+    async def _run_session_worker(self, session_id: str) -> None:
+        queue = self._session_prompt_queues.setdefault(session_id, asyncio.Queue())
+        while True:
+            task_id = await queue.get()
+            try:
+                await self._process_prompt_in_session(task_id, session_id)
+            except Exception as exc:  # noqa: BLE001
+                prompt = self._prompts.get(task_id)
+                if prompt is not None:
+                    prompt.status = "failed"
+                    prompt.error = str(exc)
+                    prompt.touch()
+                    self._publish_log(task_id, f"failed: {exc}")
+
+    async def _process_prompt_in_session(self, task_id: str, session_id: str) -> None:
+        prompt = self._prompts.get(task_id)
+        if prompt is None:
+            return
+        if prompt.status in {"completed", "cancelled", "running"}:
+            return
+
+        blockers = set(prompt.local_state.get("preflight_conflict_with_sessions", []))
+        declared_outputs = list(prompt.local_state.get("preflight_declared_outputs", []))
+        allow_override = bool(prompt.local_state.get("preflight_user_override", False))
+        needs_user_decision = bool(prompt.local_state.get("preflight_decision_required", False))
+        if needs_user_decision and not allow_override:
+            if not bool(prompt.local_state.get("preflight_blocking_notice_emitted", False)):
+                session_refs = ", ".join(sorted(blockers)) if blockers else "(unknown)"
+                self._publish_log(
+                    task_id,
+                    f"conflict decision pending: waiting on serialize conflicts: {session_refs}; use /override or /cancel",
+                )
+                prompt.local_state["preflight_blocking_notice_emitted"] = True
+            await self._pending_queue.put(task_id)
+            await asyncio.sleep(0.05)
+            return
+        if blockers and not allow_override:
+            blocking = False
+            current_keys = self._output_conflict_keys(set(prompt.local_state.get("preflight_resource_keys", [])))
+            for other_task_id, other_task in self._prompts.items():
+                other_session_id = self._task_to_session.get(other_task_id)
+                other_keys = self._output_conflict_keys(set(other_task.local_state.get("preflight_resource_keys", [])))
+                if (
+                    other_session_id in blockers
+                    and other_task.status in {"running", "paused"}
+                    and bool(current_keys.intersection(other_keys))
+                ):
+                    blocking = True
+                    break
+            if blocking:
                 await self._pending_queue.put(task_id)
                 await asyncio.sleep(0.05)
-                continue
-            if session_id and blockers and not allow_override:
-                blocking = False
-                current_keys = self._output_conflict_keys(set(prompt.local_state.get("preflight_resource_keys", [])))
-                for other_task_id, other_task in self._prompts.items():
-                    other_session_id = self._task_to_session.get(other_task_id)
-                    other_keys = self._output_conflict_keys(set(other_task.local_state.get("preflight_resource_keys", [])))
-                    if (
-                        other_session_id in blockers
-                        and other_task.status in {"running", "paused"}
-                        and bool(current_keys.intersection(other_keys))
-                    ):
-                        blocking = True
-                        break
-                if blocking:
-                    await self._pending_queue.put(task_id)
-                    await asyncio.sleep(0.05)
-                    continue
-            acquired_outputs: list[str] = []
-            if session_id and declared_outputs and not allow_override:
-                locked_by_other = False
-                for output_key in declared_outputs:
-                    holder = self._output_locks.get(output_key)
-                    if holder is not None and holder != session_id:
-                        locked_by_other = True
-                        break
-                if locked_by_other:
-                    await self._pending_queue.put(task_id)
-                    await asyncio.sleep(0.05)
-                    continue
-                for output_key in declared_outputs:
-                    if output_key not in self._output_locks:
-                        self._output_locks[output_key] = session_id
-                        acquired_outputs.append(output_key)
+                return
 
-            prompt.status = "running"
-            prompt.touch()
-            self._publish_log(task_id, "started")
+        acquired_outputs: list[str] = []
+        if declared_outputs and not allow_override:
+            locked_by_other = False
+            for output_key in declared_outputs:
+                holder = self._output_locks.get(output_key)
+                if holder is not None and holder != session_id:
+                    locked_by_other = True
+                    break
+            if locked_by_other:
+                await self._pending_queue.put(task_id)
+                await asyncio.sleep(0.05)
+                return
+            for output_key in declared_outputs:
+                if output_key not in self._output_locks:
+                    self._output_locks[output_key] = session_id
+                    acquired_outputs.append(output_key)
+
+        prompt.status = "running"
+        prompt.touch()
+        self._publish_log(task_id, "started")
+        cancel_event = asyncio.Event()
+        pause_event = asyncio.Event()
+        self._cancel_events[task_id] = cancel_event
+        self._pause_events[task_id] = pause_event
+
+        raw_tools = self._task_tools.get(task_id, {})
+        run_dir = prompt.run_dir
+        bound_tools: dict[str, Any] = {}
+        for name, tool in raw_tools.items():
+            async def _bound(
+                args: dict[str, Any],
+                tool=tool,
+                _prompt_id=task_id,
+                _run_dir=run_dir,
+                _session_id=session_id,
+            ) -> dict[str, Any]:
+                merged = dict(args)
+                merged.setdefault("_prompt_id", _prompt_id)
+                if _session_id:
+                    merged.setdefault("_session_id", _session_id)
+                if _run_dir:
+                    merged.setdefault("_prompt_run_dir", _run_dir)
+                return await tool(merged)
+
+            bound_tools[name] = _bound
+        tools = ToolRegistry(bound_tools)
+        if self._llm_client is None:
+            prompt.status = "failed"
+            prompt.error = "llm client is unavailable"
+            self._publish_log(task_id, "failed: llm client is unavailable")
+            for output_key in acquired_outputs:
+                holder = self._output_locks.get(output_key)
+                if holder == session_id:
+                    self._output_locks.pop(output_key, None)
+            self._cancel_events.pop(task_id, None)
+            self._pause_events.pop(task_id, None)
+            return
+
+        agent = self._session_agents.get(session_id)
+        if agent is None:
             seed_snapshot, seed_memory_items, seed_memory_summary = self._load_session_runtime_seed(session_id)
             prompt.local_state["session_runtime_seed"] = {
                 "context_snapshot": seed_snapshot,
                 "memory_items_count": len(seed_memory_items),
                 "memory_summary": seed_memory_summary,
             }
-
-            cancel_event = asyncio.Event()
-            pause_event = asyncio.Event()
-            self._cancel_events[task_id] = cancel_event
-            self._pause_events[task_id] = pause_event
-
-            raw_tools = self._task_tools.get(task_id, {})
-            run_dir = prompt.run_dir
-            session_id = prompt.session_id
-            bound_tools: dict[str, Any] = {}
-            for name, tool in raw_tools.items():
-                async def _bound(
-                    args: dict[str, Any],
-                    tool=tool,
-                    _prompt_id=task_id,
-                    _run_dir=run_dir,
-                    _session_id=session_id,
-                ) -> dict[str, Any]:
-                    merged = dict(args)
-                    merged.setdefault("_prompt_id", _prompt_id)
-                    if _session_id:
-                        merged.setdefault("_session_id", _session_id)
-                    if _run_dir:
-                        merged.setdefault("_prompt_run_dir", _run_dir)
-                    return await tool(merged)
-
-                bound_tools[name] = _bound
-            tools = ToolRegistry(bound_tools)
-            if self._llm_client is None:
-                prompt.status = "failed"
-                prompt.error = "llm client is unavailable"
-                self._publish_log(task_id, "failed: llm client is unavailable")
-                for output_key in acquired_outputs:
-                    holder = self._output_locks.get(output_key)
-                    if holder == session_id:
-                        self._output_locks.pop(output_key, None)
-                self._cancel_events.pop(task_id, None)
-                self._pause_events.pop(task_id, None)
-                continue
-
             agent = AgentInstance(
                 task=prompt,
                 llm_client=self._llm_client,
@@ -582,7 +621,22 @@ class Scheduler:
                     _sid, snapshot, items, summary
                 ),
             )
-            self._running[task_id] = asyncio.create_task(self._run_agent(task_id, agent))
+            self._session_agents[session_id] = agent
+        else:
+            agent.bind_turn(
+                task=prompt,
+                llm_client=self._llm_client,
+                tools=tools,
+                event_callback=lambda msg, tid=task_id: self._publish_log(tid, msg),
+                state_update_callback=lambda snapshot, items, summary, _sid=session_id: self._save_session_runtime_delta(
+                    _sid, snapshot, items, summary
+                ),
+            )
+
+        async with self._in_flight_sessions:
+            run_task = asyncio.create_task(self._run_agent(task_id, agent))
+            self._running[task_id] = run_task
+            await run_task
 
     async def _run_agent(self, task_id: str, agent: AgentInstance) -> None:
         prompt = self._prompts[task_id]

@@ -9,7 +9,7 @@ from main import (
     _is_watch_slot_blocking,
     _normalize_user_input,
     _parse_new,
-    _parse_run,
+    _parse_prompt,
     _parse_submit,
     _parse_ack_indices,
     _resolve_request_id_from_approve_cmd,
@@ -53,9 +53,9 @@ def test_normalize_user_input_preserves_yn() -> None:
 
 def test_parse_new_run_submit_commands() -> None:
     assert _parse_new("new hello") == "hello"
-    assert _parse_run("run hello") == "hello"
+    assert _parse_prompt("prompt hello") == "hello"
     assert _parse_submit("submit hello") == "hello"
-    assert _parse_new("run hello") is None
+    assert _parse_new("prompt hello") is None
 
 
 def test_get_task_pending_approval_request_id() -> None:
@@ -158,7 +158,7 @@ def test_scheduler_continue_task_reuses_same_task_id() -> None:
     task.local_state["initial_input"] = "first"
     scheduler.prompts[task.task_id] = task
     scheduler._task_tools[task.task_id] = {}  # noqa: SLF001
-    ok = asyncio.run(scheduler.continue_task(task.task_id, "hello"))
+    ok = asyncio.run(scheduler.continue_session_prompt(task.task_id, "hello"))
     assert ok is True
     assert task.task_id == "keep-1"
     assert task.input == "hello"

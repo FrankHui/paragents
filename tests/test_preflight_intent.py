@@ -9,7 +9,7 @@ from scheduler import Scheduler
 class _SleepLLM:
     async def infer(self, messages):  # noqa: ANN001
         await asyncio.sleep(0.2)
-        return {"type": "final", "content": "ok"}
+        return {"type": "turn_done", "content": "ok"}
 
 
 class _PreflightLLM:
@@ -37,7 +37,7 @@ def test_infer_preflight_intent_detects_implicit_git_and_output() -> None:
 def test_submit_persists_preflight_intent_in_prompt_local_state() -> None:
     scheduler = Scheduler(llm_client=None)
     prompt_id = asyncio.run(
-        scheduler.submit(
+        scheduler.create_session_prompt(
             "把这次代码提交，并输出到 reports/result.json",
             tools={},
             session_id="session-a",
@@ -55,7 +55,7 @@ def test_submit_persists_preflight_intent_in_prompt_local_state() -> None:
 def test_continue_task_recomputes_preflight_intent() -> None:
     scheduler = Scheduler(llm_client=None)
     prompt_id = asyncio.run(
-        scheduler.submit(
+        scheduler.create_session_prompt(
             "写一段普通文本",
             tools={},
             session_id="session-a",
@@ -63,7 +63,7 @@ def test_continue_task_recomputes_preflight_intent() -> None:
     )
     prompt = scheduler.prompts[prompt_id]
     prompt.status = "completed"
-    ok = asyncio.run(scheduler.continue_task(prompt_id, "把这次代码提交，并输出到 reports/new.json"))
+    ok = asyncio.run(scheduler.continue_session_prompt(prompt_id, "把这次代码提交，并输出到 reports/new.json"))
     assert ok is True
 
     intent_state = prompt.local_state.get("preflight_intent", {})
@@ -85,10 +85,10 @@ def test_dispatch_not_blocked_by_unrelated_running_prompt_in_blocker_session() -
     scheduler = Scheduler(llm_client=_SleepLLM(), max_in_flight=2)
 
     async def _run() -> None:
-        old_id = await scheduler.submit("git commit -m 'x'", tools={}, session_id="session-A")
+        old_id = await scheduler.create_session_prompt("git commit -m 'x'", tools={}, session_id="session-A")
         scheduler.prompts[old_id].status = "completed"
-        await scheduler.submit("echo hello", tools={}, session_id="session-A")
-        target_id = await scheduler.submit("把这次代码提交", tools={}, session_id="session-B")
+        await scheduler.create_session_prompt("echo hello", tools={}, session_id="session-A")
+        target_id = await scheduler.create_session_prompt("把这次代码提交", tools={}, session_id="session-B")
         await scheduler.start()
         await asyncio.sleep(0.1)
         target_status = scheduler.prompts[target_id].status
