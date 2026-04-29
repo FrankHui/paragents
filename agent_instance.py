@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Callable
 from typing import Any
 
+from hook_runtime import HookRuntime
 from llm_client import LLMClient
 from memory import LocalMemory
 from task import Prompt
@@ -17,11 +18,13 @@ class AgentInstance:
         llm_client: LLMClient,
         tools: ToolRegistry,
         event_callback: Callable[[str], None] | None = None,
+        hook_runtime: HookRuntime | None = None,
     ) -> None:
         self.task = task
         self.llm_client = llm_client
         self.tools = tools
         self._event_callback = event_callback
+        self.hook_runtime = hook_runtime
         self.memory = LocalMemory()
         tool_names = self.tools.list_tool_names()
         self.context: list[dict[str, str]] = [
@@ -75,14 +78,43 @@ class AgentInstance:
         if err_preview:
             self._emit(f"{tool_name} stderr: {err_preview}")
 
+    def _apply_stop_hook(self, reason: str) -> None:
+        if self.hook_runtime is None:
+            return
+        decision = self.hook_runtime.on_stop(
+            {"prompt_id": self.task.prompt_id, "session_id": self.task.session_id, "status": self.task.status, "reason": reason}
+        )
+        if decision.action == "warn":
+            self._emit(f"hook warning(Stop): {decision.message}")
+        if decision.action == "block":
+            self.task.status = "paused"
+            self.task.local_state["hook_blocked"] = True
+            self.task.local_state["hook_stage"] = "Stop"
+            self.task.local_state["hook_message"] = decision.message
+            self.task.touch()
+            self._emit(f"blocked by hook(Stop): {decision.message}")
+
     async def run(self, cancel_event: asyncio.Event, pause_event: asyncio.Event | None = None) -> None:
         max_steps = 10
         self._emit("agent started")
+        if self.hook_runtime is not None:
+            submit_decision = self.hook_runtime.on_user_prompt_submit(
+                {"prompt_id": self.task.prompt_id, "session_id": self.task.session_id, "input": self.task.input}
+            )
+            if submit_decision.action == "block":
+                self.task.status = "paused"
+                self.task.local_state["hook_blocked"] = True
+                self.task.local_state["hook_stage"] = "UserPromptSubmit"
+                self.task.local_state["hook_message"] = submit_decision.message
+                self.task.touch()
+                self._emit(f"blocked by hook(UserPromptSubmit): {submit_decision.message}")
+                return
 
         for step in range(max_steps):
             if cancel_event.is_set():
                 self.task.status = "cancelled"
                 self.task.touch()
+                self._apply_stop_hook("cancelled")
                 self._emit("task cancelled")
                 return
 
@@ -98,6 +130,7 @@ class AgentInstance:
                 self.task.result = llm_output.get("content")
                 self.task.status = "completed"
                 self.task.touch()
+                self._apply_stop_hook("completed")
                 self._emit("task completed")
                 return
 
@@ -111,10 +144,36 @@ class AgentInstance:
                         args["path"] = inferred_path
                         self._emit(f"step={step + 1}: inferred read_file path -> {inferred_path}")
                 self._emit(f"step={step + 1}: tool call -> {tool_name}")
+                if self.hook_runtime is not None:
+                    pre_decision = self.hook_runtime.on_pre_tool_use(
+                        {"tool_name": tool_name, "args": args, "prompt_id": self.task.prompt_id}
+                    )
+                    if pre_decision.action == "block":
+                        self.task.status = "paused"
+                        self.task.local_state["hook_blocked"] = True
+                        self.task.local_state["hook_stage"] = "PreToolUse"
+                        self.task.local_state["hook_message"] = pre_decision.message
+                        self.task.touch()
+                        self._emit(f"blocked by hook(PreToolUse): {pre_decision.message}")
+                        return
                 observation = await self.tools.call(tool_name, args)
                 await self.memory.append({"tool": tool_name, "args": args, "observation": observation})
                 self.task.local_state["last_observation"] = observation
                 self._emit_stream_preview(tool_name, observation)
+                if self.hook_runtime is not None:
+                    post_decision = self.hook_runtime.on_post_tool_use(
+                        {"tool_name": tool_name, "args": args, "observation": observation}
+                    )
+                    if post_decision.action == "block":
+                        self.task.status = "paused"
+                        self.task.local_state["hook_blocked"] = True
+                        self.task.local_state["hook_stage"] = "PostToolUse"
+                        self.task.local_state["hook_message"] = post_decision.message
+                        self.task.touch()
+                        self._emit(f"blocked by hook(PostToolUse): {post_decision.message}")
+                        return
+                    if post_decision.action == "warn":
+                        self._emit(f"hook warning(PostToolUse): {post_decision.message}")
                 if isinstance(observation, dict) and observation.get("needs_approval"):
                     request_id = str(observation.get("request_id", ""))
                     approval_type = str(observation.get("approval_type", "")).strip()
@@ -151,12 +210,14 @@ class AgentInstance:
             self.task.status = "failed"
             self.task.error = f"Unknown LLM output type: {output_type}"
             self.task.touch()
+            self._apply_stop_hook("unknown_output_type")
             self._emit(f"task failed: unknown output type {output_type}")
             return
 
         self.task.status = "failed"
         self.task.error = "Max steps exceeded"
         self.task.touch()
+        self._apply_stop_hook("max_steps_exceeded")
         self._emit("task failed: max steps exceeded")
 
     def _infer_path_from_task_input(self) -> str:
