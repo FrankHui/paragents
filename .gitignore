@@ -3,3 +3,4 @@ __pycache__/
 .venv/
 runtime_config.json
 permissions.json
+.paragents/
