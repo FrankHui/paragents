@@ -1,48 +1,38 @@
-# Paragents
+<p align="center">
+  <img src="assets/logo.png" alt="Paragents Logo"/>
+</p>
 
-[中文文档](./README.zh-CN.md)
+<p align="center"><strong>
+Parallel agent sessions in one panel, with permission-aware tools, preflight conflict checks.
+</strong></p>
 
-Paragents is a toy, easy-hack self-learning project for building a parallel-agent runtime in Python (`asyncio` + TUI). It is inspired by 4 other agent repos ([claude-code](https://github.com/anthropics/claude-code), [mercury-agent](https://github.com/cosmicstack-labs/mercury-agent), [hermes-agent](https://github.com/NousResearch/hermes-agent), [nanobot](https://github.com/HKUDS/nanobot)), and borrows ideas (and in some places implementation patterns) for learning and experimentation.  
-It is intentionally optimized for readability and experimentation, not production hardening.
+<p align="center">
+Remembers context across turns. Asks before risky actions. Runs parallel sessions with conflict-safe execution.
+<br />
+TUI-first workflow, extensible tools, and explicit policy gates.
+</p>
 
-## Project Positioning
+<p align="center">
+  Inspired by 4 other agent repos:
+  <a href="https://github.com/anthropics/claude-code">claude-code</a>,
+  <a href="https://github.com/cosmicstack-labs/mercury-agent">mercury-agent</a>,
+  <a href="https://github.com/NousResearch/hermes-agent">hermes-agent</a>,
+  <a href="https://github.com/HKUDS/nanobot">nanobot</a>.
+</p>
 
-- This repo is an **experimental playground**, not a production framework.
-- APIs and internal contracts may change quickly.
-- The core value is to make agent runtime ideas easy to read, test, and iterate.
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="Python 3.11+" />
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License" />
+</p>
 
-## Why Parallel-Agent
-
-The current design focuses on **multi-session parallelism** with per-session continuity:
-
-- Session-based scheduler and worker model
-- Single active agent instance per session (reused across turns)
-- Session-level context + memory persistence
-- Preflight conflict checks (especially output conflicts) and approval flow
-- TUI-first operations for observing multiple sessions
-
-```mermaid
-flowchart LR
-  UserInput[UserInput] --> Scheduler[Scheduler]
-  Scheduler --> SessionQueue[SessionPromptQueue]
-  SessionQueue --> SessionWorker[SessionWorker]
-  SessionWorker --> AgentInstance[AgentInstance]
-  AgentInstance --> Tools[ToolsAndPermissions]
-  AgentInstance --> ContextState[SessionRuntimeState]
-  ContextState --> Scheduler
-```
-
-Key implementation files:
-
-- `main.py`
-- `scheduler.py`
-- `agent_instance.py`
-- `session_runtime.py`
-- `tui_app.py`
+<p align="center">
+  <a href="./README.md">English</a> | <a href="./README.zh-CN.md">简体中文</a>
+</p>
 
 ## Demo
 
-![Paragents demo](./assets/paragent_demo.gif)
+![Paragents demo](assets/paragent_demo.gif)
+
 
 ## Quick Start (TUI Only)
 
@@ -85,6 +75,36 @@ uv run python main.py
 | `/setup` | Re-run runtime/provider setup |
 | `/show-config` | Show runtime config file path and provider info |
 | `/quit` | Exit TUI |
+
+
+## Why Parallel-Agent
+
+The current design focuses on **multi-session parallelism** with per-session continuity:
+
+- Session-based scheduler and worker model
+- Single active agent instance per session (reused across turns)
+- Session-level context + memory persistence
+- Preflight conflict checks (especially output conflicts) and approval flow
+- TUI-first operations for observing multiple sessions
+
+```mermaid
+flowchart LR
+  UserInput[UserInput] --> Scheduler[Scheduler]
+  Scheduler --> SessionQueue[SessionPromptQueue]
+  SessionQueue --> SessionWorker[SessionWorker]
+  SessionWorker --> AgentInstance[AgentInstance]
+  AgentInstance --> Tools[ToolsAndPermissions]
+  AgentInstance --> ContextState[SessionRuntimeState]
+  ContextState --> Scheduler
+```
+
+Key implementation files:
+
+- `main.py`
+- `scheduler.py`
+- `agent_instance.py`
+- `session_runtime.py`
+- `tui_app.py`
 
 
 ## Cross-Repo Learning Notes (inlined)
